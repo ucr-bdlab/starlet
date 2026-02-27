@@ -160,3 +160,4 @@ source .venv/bin/activate
 ### Dataset Requirement
 - Download the required datasets from the UCR STAR repository.
 - Place the datasets in the `datasets/` directory following the structure outlined in this repository.
+Make sure that when a tile is askedd for no data region, empty tile is returned
