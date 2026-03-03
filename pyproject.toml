@@ -1,5 +1,5 @@
 [project]
-name = "starlet"
+name = "starlet-test"
 version = "0.1.0"
 description = "Spatial tiling, MVT generation, and tile serving for geospatial data"
 readme = "README.md"
@@ -12,24 +12,13 @@ dependencies = [
     "shapely>=2.0",
     "click>=8",
     "ijson>=3.3",
-]
-
-[project.optional-dependencies]
-mvt = [
     "mapbox-vector-tile>=2",
     "pyproj>=3",
-]
-server = [
     "flask>=3",
     "flask-cors",
     "geopandas>=0.14",
-    "pyproj>=3",
-    "mapbox-vector-tile>=2",
     "gunicorn",
     "datasketch",
-]
-all = [
-    "starlet[mvt,server]",
 ]
 
 [project.scripts]
