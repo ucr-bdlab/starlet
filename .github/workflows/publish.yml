@@ -22,13 +22,13 @@ jobs:
         run: python -m pip install --upgrade pip build
 
       - name: Build package
-        run: python -m build ./tile-geoparquet
+        run: python -m build
 
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
         with:
           name: python-package-distributions
-          path: tile-geoparquet/dist/
+          path: dist/
 
   publish:
     name: Publish to PyPI
