@@ -178,10 +178,24 @@ class GeometrySketch:
                 self.maxx = max(self.maxx, maxx)
                 self.maxy = max(self.maxy, maxy)
 
-            try:
-                self.total_points += len(geom.coords)
-            except Exception:
-                pass
+            self.total_points += self._count_coords(geom)
+
+    @staticmethod
+    def _count_coords(geom) -> int:
+        """Recursively count vertices in any geometry type."""
+        geom_type = geom.geom_type
+        if geom_type == 'Point':
+            return 1
+        elif geom_type in ('LineString', 'LinearRing'):
+            return len(geom.coords)
+        elif geom_type == 'Polygon':
+            count = len(geom.exterior.coords)
+            for ring in geom.interiors:
+                count += len(ring.coords)
+            return count
+        elif geom_type.startswith('Multi') or geom_type == 'GeometryCollection':
+            return sum(GeometrySketch._count_coords(part) for part in geom.geoms)
+        return 0
 
 
     def finalize(self):

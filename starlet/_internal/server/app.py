@@ -189,14 +189,8 @@ def create_app(
         dataset_path = data_root / dataset
         if not dataset_path.exists() or not dataset_path.is_dir():
             return "<h1>Dataset not found</h1>", 404
-        try:
-            return render_template(
-                "view_dataset.html",
-                dataset_id=dataset,
-                dataset_name=dataset.replace("_", " ").title(),
-            )
-        except Exception as e:
-            return f"<h1>Failed to render visualization: {str(e)}</h1>", 500
+        from flask import redirect
+        return redirect(f"/view_mvt.html?dataset={dataset}")
 
     @app.get("/datasets/<dataset>/features/sample.json")
     def get_sample_non_geometry_attributes(dataset):
