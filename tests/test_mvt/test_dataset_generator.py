@@ -15,7 +15,6 @@ from starlet._internal.mvt.mvt_generator import (
     _group_splits,
     _group_table_batches,
     _positive_bounds_tuple,
-    _property_value,
     _sample_single_tile_records,
     _single_tile_index_cache,
     _single_tile_parquet_index,
@@ -67,13 +66,6 @@ def test_positive_bounds_tuple_expands_zero_sized_bounds():
     assert maxy > miny
 
 
-def test_property_value_keeps_simple_scalars_and_stringifies_complex_values():
-    assert _property_value("x") == "x"
-    assert _property_value(10) == 10
-    assert _property_value(1.5) == 1.5
-    assert _property_value(("a", "b")) == "('a', 'b')"
-
-
 def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
     dataset_dir = tmp_path / "dataset"
     parquet_dir = dataset_dir / "parquet_tiles"
@@ -89,6 +81,7 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
                 wkb.dumps(Point(-100.0, 80.0)),
                 wkb.dumps(Point(100.0, -80.0)),
             ],
+            "_id": [10, 11],
             "id": [1, 2],
             "_bbox_xmin": [-100.0, 100.0],
             "_bbox_ymin": [80.0, -80.0],
@@ -110,7 +103,132 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
 
     features = decoded["layer0"]["features"]
     assert len(features) == 1
-    assert features[0]["properties"] == {"id": 1}
+    assert features[0]["properties"] == {"_id": 10, "id": 1}
+
+
+def test_generate_single_mvt_tile_projects_requested_attributes(tmp_path, monkeypatch):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(-100.0, 80.0))],
+            "id": [1],
+            "name": ["keep"],
+            "unused": ["drop"],
+            "_bbox_xmin": [-100.0],
+            "_bbox_ymin": [80.0],
+            "_bbox_xmax": [-100.0],
+            "_bbox_ymax": [80.0],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__-100_0_80_0_-100_0_80_0.parquet",
+    )
+
+    read_columns = []
+    original_read_table = mvt_generator.pq.read_table
+
+    def recording_read_table(*args, **kwargs):
+        read_columns.append(kwargs.get("columns"))
+        return original_read_table(*args, **kwargs)
+
+    monkeypatch.setattr(mvt_generator.pq, "read_table", recording_read_table)
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (1, 0, 0),
+        feature_capacity=10,
+        attributes=["name"],
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["features"][0]["properties"] == {"name": "keep"}
+    assert read_columns == [["geometry", "name", "_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"]]
+
+
+def test_generate_single_mvt_tile_flattens_nested_map_properties(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(-100.0, 80.0))],
+            "id": [1],
+            "tagsMap": pa.array(
+                [[("name", "Oak Hill"), ("landuse", "cemetery")]],
+                type=pa.map_(pa.string(), pa.string()),
+            ),
+            "_bbox_xmin": [-100.0],
+            "_bbox_ymin": [80.0],
+            "_bbox_xmax": [-100.0],
+            "_bbox_ymax": [80.0],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__-100_0_80_0_-100_0_80_0.parquet",
+    )
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (1, 0, 0),
+        feature_capacity=10,
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["features"][0]["properties"] == {
+        "id": 1,
+        "tagsMap.name": "Oak Hill",
+        "tagsMap.landuse": "cemetery",
+    }
+
+
+def test_generate_single_mvt_tile_keeps_feature_id_without_bbox_columns(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(-100.0, 80.0))],
+            "_id": [42],
+            "id": [1],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__-100_0_80_0_-100_0_80_0.parquet",
+    )
+
+    # Warm the public-query cache first; on-demand MVT must still be able to
+    # opt into _id even if a hidden-column read happened earlier.
+    index = ParquetIndex(parquet_dir)
+    assert "_id" not in next(index.iter_query_batches((-101.0, 79.0, -99.0, 81.0))).columns
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (1, 0, 0),
+        feature_capacity=10,
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["features"][0]["properties"] == {"_id": 42, "id": 1}
 
 
 def test_generate_single_mvt_tile_queries_buffered_tile_bounds(tmp_path):
@@ -358,4 +476,56 @@ def test_dataset_generator_removes_mvt_dir_after_pmtiles_export(monkeypatch, tmp
     assert result.tile_count == 1
     assert result.pmtiles_path == str(dataset_dir / "tiles.pmtiles")
     assert exported["output_path"] == str(dataset_dir / "tiles.pmtiles")
+    assert not generator.outdir.exists()
+
+
+def test_dataset_generator_skips_pmtiles_export_when_threshold_filters_all_tiles(
+    monkeypatch,
+    tmp_path,
+):
+    from starlet._internal.mvt.mvt_generator import DatasetMVTGenerator, _MapStageResult
+
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    hist_dir = dataset_dir / "histograms"
+    parquet_dir.mkdir(parents=True)
+    hist_dir.mkdir(parents=True)
+    (hist_dir / "global_prefix.npy").write_bytes(b"fake")
+
+    generator = DatasetMVTGenerator(
+        str(dataset_dir),
+        num_zoom_levels=2,
+        threshold=100_000,
+        output_format="pmtiles",
+    )
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.GeoParquetSource",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator._create_map_groups",
+        lambda source, workers: [[object()]],
+    )
+    monkeypatch.setattr(
+        DatasetMVTGenerator,
+        "_run_map_stage",
+        lambda self, groups, source, temp_root: [_MapStageResult("tmp", [])],
+    )
+
+    def make_empty_output(self, map_results):
+        self.outdir.mkdir(parents=True)
+
+    monkeypatch.setattr(DatasetMVTGenerator, "_run_reduce_stage", make_empty_output)
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.export_to_pmtiles",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("empty tiles exported")),
+    )
+
+    result = generator.run()
+
+    assert result.tile_count == 0
+    assert result.tile_counts_by_zoom == []
+    assert result.zoom_levels == []
+    assert result.pmtiles_path is None
     assert not generator.outdir.exists()

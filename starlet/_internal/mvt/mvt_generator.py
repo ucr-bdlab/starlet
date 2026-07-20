@@ -35,19 +35,14 @@ from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile, feat
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
 from starlet._internal.pmtiles.paths import default_pmtiles_path
 from starlet._internal.pmtiles.exporter import export_to_pmtiles
-from starlet._internal.server.tiler.parquet_index import INTERNAL_COLS, ParquetIndex
+from starlet._internal.internal_columns import BBOX_COLS, MVT_EXCLUDED_ATTRIBUTE_COLS
+from starlet._internal.server.tiler.parquet_index import ParquetIndex
 from starlet._internal.tiling.crs import WEB_MERCATOR_CRS, WGS84_CRS, geoparquet_crs, reproject_geometries
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
 
 logger = logging.getLogger(__name__)
 
-_INTERNAL_ATTRIBUTE_COLUMNS = {
-    "_tile_id",
-    "_bbox_xmin",
-    "_bbox_ymin",
-    "_bbox_xmax",
-    "_bbox_ymax",
-}
+_INTERNAL_ATTRIBUTE_COLUMNS = set(MVT_EXCLUDED_ATTRIBUTE_COLS)
 _SINGLE_TILE_INDEX_CACHE_SIZE = 16
 _single_tile_index_cache: "OrderedDict[str, ParquetIndex]" = OrderedDict()
 _REDUCE_GROUP_SIZE = 10
@@ -159,13 +154,20 @@ class DatasetMVTGenerator:
 
         pmtiles_path = None
         if self.output_format == "pmtiles":
-            pmtiles_path = str(self.pmtiles_path)
-            export_to_pmtiles(
-                mvt_dir=str(self.outdir),
-                output_path=pmtiles_path,
-                tile_type="mvt",
-                compression=self.pmtiles_compression,
-            )
+            if tile_count == 0:
+                logger.warning(
+                    "No MVT tiles passed threshold %s; skipping PMTiles export. "
+                    "Lower the MVT threshold to generate a prebuilt pyramid.",
+                    self.threshold,
+                )
+            else:
+                pmtiles_path = str(self.pmtiles_path)
+                export_to_pmtiles(
+                    mvt_dir=str(self.outdir),
+                    output_path=pmtiles_path,
+                    tile_type="mvt",
+                    compression=self.pmtiles_compression,
+                )
             if self.outdir.exists():
                 shutil.rmtree(self.outdir)
         return DatasetMVTGenerationResult(
@@ -379,6 +381,7 @@ def generate_single_mvt_tile(
     extent: int | None = None,
     buffer: int | None = None,
     layer_name: str = "layer0",
+    attributes: Sequence[str] | None = None,
 ) -> bytes:
     """Generate one MVT tile directly from an indexed Starlet dataset."""
     feature_capacity = int(
@@ -396,17 +399,20 @@ def generate_single_mvt_tile(
     query_bounds = _expand_tile_bounds_for_buffer(tile_bounds, extent, buffer)
     index = _single_tile_parquet_index(parquet_dir)
     query_bounds_4326 = index._transform_bbox(query_bounds, WEB_MERCATOR_CRS, WGS84_CRS)
+    attribute_set = _normalize_attribute_whitelist(attributes)
 
     sampled_features = _sample_single_tile_records(
         index,
         query_bounds_4326,
         feature_capacity,
+        attributes=attribute_set,
     )
     if sampled_features is None:
         sampled_features = _sample_single_tile_records_legacy(
             index,
             query_bounds_4326,
             feature_capacity,
+            attributes=attribute_set,
         )
 
     tile = IntermediateVectorTile(
@@ -428,6 +434,8 @@ def _sample_single_tile_records(
     index: ParquetIndex,
     query_bounds_4326: tuple[float, float, float, float],
     feature_capacity: int,
+    *,
+    attributes: frozenset[str] | None = None,
 ) -> list[tuple[Any, dict[str, Any], int]] | None:
     """Top-k sample raw parquet rows by priority before WKB parsing.
 
@@ -451,7 +459,7 @@ def _sample_single_tile_records(
             return None
 
         bbox_native = index._transform_bbox(query_bounds_4326, WGS84_CRS, crs)
-        table = _read_bbox_filtered_table(path, bbox_native)
+        table = _read_bbox_filtered_table(path, bbox_native, geom_col=geom_col, attributes=attributes)
         if table.num_rows == 0:
             continue
         for row_idx, geometry_wkb in enumerate(table[geom_col].to_pylist()):
@@ -478,18 +486,27 @@ def _row_attrs(table: pa.Table, geom_col: str, row_idx: int) -> dict[str, Any]:
     """Attribute dict for a single sampled row (winners only)."""
     attrs: dict[str, Any] = {}
     for column in table.column_names:
-        if column == geom_col or column in INTERNAL_COLS:
+        if column == geom_col or column in _INTERNAL_ATTRIBUTE_COLUMNS:
             continue
         value = table[column][row_idx].as_py()
         if value is not None:
-            attrs[column] = _property_value(value)
+            attrs[column] = value
     return attrs
+
+
+def _normalize_attribute_whitelist(attributes: Sequence[str] | None) -> frozenset[str] | None:
+    if attributes is None:
+        return None
+    normalized = frozenset(str(attribute).strip() for attribute in attributes if str(attribute).strip())
+    return normalized
 
 
 def _sample_single_tile_records_legacy(
     index: ParquetIndex,
     query_bounds_4326: tuple[float, float, float, float],
     feature_capacity: int,
+    *,
+    attributes: frozenset[str] | None = None,
 ) -> list[tuple[Any, dict[str, Any], int]]:
     """Top-k sample after exact legacy geometry filtering (no bbox columns).
 
@@ -502,11 +519,16 @@ def _sample_single_tile_records_legacy(
     heap: list[tuple[int, int, Any, dict[str, Any], int]] = []
     seq = 0
 
-    for gdf in index.iter_query_batches(query_bounds_4326, target_crs=WEB_MERCATOR_CRS):
+    for gdf in index.iter_query_batches(
+        query_bounds_4326,
+        target_crs=WEB_MERCATOR_CRS,
+        include_feature_id=True,
+        attributes=attributes,
+    ):
         col_arrays = {
             column: gdf[column].to_numpy()
             for column in gdf.columns
-            if column != "geometry" and column not in INTERNAL_COLS
+            if column != "geometry" and column not in _INTERNAL_ATTRIBUTE_COLUMNS
         }
         for row_idx, geom in enumerate(gdf.geometry.values):
             if geom is None or geom.is_empty:
@@ -524,18 +546,20 @@ def _sample_single_tile_records_legacy(
     return [
         (
             geom,
-            {
-                column: _property_value(values[row_idx])
-                for column, values in col_arrays.items()
-                if values[row_idx] is not None
-            },
+            _attrs_for_row(col_arrays, row_idx),
             priority,
         )
         for (priority, _, geom, col_arrays, row_idx) in heap
     ]
 
 
-def _read_bbox_filtered_table(path: Path, bbox_native: tuple[float, float, float, float]) -> pa.Table:
+def _read_bbox_filtered_table(
+    path: Path,
+    bbox_native: tuple[float, float, float, float],
+    *,
+    geom_col: str,
+    attributes: frozenset[str] | None = None,
+) -> pa.Table:
     minx, miny, maxx, maxy = bbox_native
     flt = (
         (pc.field("_bbox_xmax") >= minx)
@@ -543,7 +567,12 @@ def _read_bbox_filtered_table(path: Path, bbox_native: tuple[float, float, float
         & (pc.field("_bbox_ymax") >= miny)
         & (pc.field("_bbox_ymin") <= maxy)
     )
-    return pq.read_table(path, filters=flt)
+    columns = None
+    if attributes is not None:
+        names = pq.ParquetFile(path).schema_arrow.names
+        required = {geom_col, *BBOX_COLS}
+        columns = [name for name in names if name in required or name in attributes]
+    return pq.read_table(path, filters=flt, columns=columns)
 
 
 def _decode_sampled_features(
@@ -618,11 +647,7 @@ def _iter_web_mercator_features(table: Any, geom_col: str) -> Iterable[tuple[Any
     for index, geom in enumerate(geometries):
         if geom is None or geom.is_empty:
             continue
-        attrs = {
-            column: _property_value(values[index])
-            for column, values in attrs_by_column.items()
-            if values[index] is not None
-        }
+        attrs = _attrs_for_row(attrs_by_column, index)
         # Priority from the *source* WKB bytes: identical for this feature in
         # every tile/zoom it touches (and in the on-demand serving sampler),
         # which is what makes sampling seam-consistent.
@@ -638,10 +663,12 @@ def _positive_bounds_tuple(bounds: tuple[float, float, float, float]) -> tuple[f
     return minx, miny, maxx, maxy
 
 
-def _property_value(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
+def _attrs_for_row(attrs_by_column: dict[str, Any], row_idx: int) -> dict[str, Any]:
+    return {
+        column: values[row_idx]
+        for column, values in attrs_by_column.items()
+        if values[row_idx] is not None
+    }
 
 
 def _group_splits(splits: Sequence[GeoParquetSplit], num_groups: int) -> list[list[GeoParquetSplit]]:

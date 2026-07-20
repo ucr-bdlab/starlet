@@ -7,8 +7,10 @@ Tests cover:
 - Error handling for missing files
 - Schema validation
 """
+import bz2
 import json
 import logging
+import os
 import struct
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +18,7 @@ from pathlib import Path
 
 import pytest
 import geopandas as gpd
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyproj import Transformer
@@ -30,13 +33,14 @@ from starlet._internal.tiling.datasource import (
     CSVSource,
     GDBSource,
     ShapefileSource,
-    _zip_gdb_member_dirs,
+    _properties_dataframe_to_arrow_table,
     read_spatial_sample,
     source_for_path,
 )
 from starlet._internal.tiling.geojson_source import iter_geojson_xy
 from starlet._internal.tiling.geoparquet_source import _read_geoparquet_split_spatial_sample
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
+from starlet._internal.tiling.vector_source import _zip_gdb_member_dirs
 
 
 def _linestring_wkb(coords):
@@ -53,6 +57,17 @@ def _multicurve_wkb(lines):
     for coords in lines:
         data.extend(_linestring_wkb(coords))
     return bytes(data)
+
+
+def _write_bz2(path: Path, data: bytes, *, compresslevel: int = 1) -> None:
+    path.write_bytes(bz2.compress(data, compresslevel=compresslevel))
+
+
+def _write_zip_from_dir(zip_path: Path, source_dir: Path) -> None:
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for member in sorted(source_dir.rglob("*")):
+            if member.is_file():
+                archive.write(member, arcname=member.relative_to(source_dir).as_posix())
 
 
 class TestGeoParquetSource:
@@ -412,16 +427,10 @@ class TestGeoJSONSource:
         tables = list(source.iter_tables())
 
         _tags_types = {table.schema.field("tagsMap").type for table in tables}
-        # nested dict properties are coerced to a stable string type across batches
-        # (string or large_string depending on the pyarrow version) — the key
-        # property is a single, consistent string type, never a struct.
-        assert len(_tags_types) == 1
-        assert all(
-            pa.types.is_large_string(t) or pa.types.is_string(t) for t in _tags_types
-        )
-        assert [value for table in tables for value in table["tagsMap"].to_pylist()] == [
-            '{"a":"1"}',
-            '{"b":"2"}',
+        assert _tags_types == {pa.map_(pa.string(), pa.string())}
+        assert [dict(value) for table in tables for value in table["tagsMap"].to_pylist()] == [
+            {"a": "1"},
+            {"b": "2"},
         ]
 
     def test_geojson_null_first_batch_promotes_later_string_column(self, temp_dir):
@@ -452,6 +461,85 @@ class TestGeoJSONSource:
         promoted_type = tables[-1].schema.field("OLD_BLD_ID").type
         assert pa.types.is_large_string(promoted_type) or pa.types.is_string(promoted_type)
         assert tables[-1]["OLD_BLD_ID"].to_pylist() == ["B123"]
+
+    def test_geojson_mixed_scalar_property_values_promote_to_string(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"parcel_id": "A123"},
+                    "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"parcel_id": 123.5},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                },
+            ],
+        }
+
+        json_path = temp_dir / "mixed_scalar_property.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f)
+
+        source = GeoJSONSource(str(json_path), batch_rows=1)
+        schema = source.schema()
+        tables = list(source.iter_tables())
+
+        assert pa.types.is_large_string(schema.field("parcel_id").type)
+        assert {table.schema.field("parcel_id").type for table in tables} == {
+            pa.large_string()
+        }
+        assert [value for table in tables for value in table["parcel_id"].to_pylist()] == [
+            "A123",
+            "123.5",
+        ]
+
+    def test_geojson_numeric_property_type_is_stable_across_batches(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"TOTAL_UNITS": 10},
+                    "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"TOTAL_UNITS": 2.5, "STATUS": "active"},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                },
+            ],
+        }
+
+        json_path = temp_dir / "numeric_promotion.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f)
+
+        source = GeoJSONSource(str(json_path), batch_rows=1)
+        schema = source.schema()
+        tables = list(source.iter_tables())
+
+        assert schema.field("TOTAL_UNITS").type == pa.float64()
+        assert schema.field("STATUS").type == pa.string()
+        assert all(table.schema.equals(schema) for table in tables)
+        assert [value for table in tables for value in table["TOTAL_UNITS"].to_pylist()] == [
+            10.0,
+            2.5,
+        ]
+        assert [value for table in tables for value in table["STATUS"].to_pylist()] == [
+            None,
+            "active",
+        ]
+
+    def test_geojson_arrow_inference_failure_promotes_property_to_string(self):
+        table = _properties_dataframe_to_arrow_table(
+            pd.DataFrame({"parcel_id": [b"A123", 123.5]})
+        )
+
+        assert pa.types.is_large_string(table.schema.field("parcel_id").type)
+        assert table["parcel_id"].to_pylist() == ["b'A123'", "123.5"]
 
     def test_geojson_splits_read_independently_from_threads(self, temp_dir):
         """Test GeoJSON byte splits can be read independently by threads."""
@@ -527,6 +615,34 @@ class TestGeoJSONSource:
         assert {Path(split.path).name for split in splits} == {"part-0.geojson", "part-1.geojson"}
         assert ids == [1, 2]
 
+    def test_bzip2_feature_collection_splits_read_features_once(self, temp_dir):
+        features = [
+            {
+                "type": "Feature",
+                "properties": {
+                    "id": i,
+                    "blob": os.urandom(120).hex(),
+                },
+                "geometry": {"type": "Point", "coordinates": [float(i), float(i)]},
+            }
+            for i in range(8_000)
+        ]
+        payload = json.dumps({"type": "FeatureCollection", "features": features}).encode("utf-8")
+        json_path = temp_dir / "features.geojson.bz2"
+        _write_bz2(json_path, payload, compresslevel=1)
+
+        source = GeoJSONSource(str(json_path), batch_rows=256)
+        splits = source.create_splits(num_splits=4)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["id"].to_pylist()
+        ]
+
+        assert len(splits) == 4
+        assert ids == list(range(8_000))
+
     def test_read_spatial_sample_returns_mbr_and_sample(self, temp_dir):
         """Test standalone sampling reads centroids and global MBR from a file."""
         geojson = {
@@ -560,8 +676,44 @@ class TestGeoJSONSource:
         assert spatial_sample.total_seen == 2
         assert spatial_sample.total_sampled == 2
         assert spatial_sample.sample_points.shape == (2, 2)
+        assert spatial_sample.schema is not None
+        assert spatial_sample.schema.field("id").type == pa.int64()
+        assert spatial_sample.schema.field("geometry").type == pa.binary()
         assert spatial_sample.mbr.mins.tolist() == [0.0, 2.0]
         assert spatial_sample.mbr.maxs.tolist() == [10.0, 12.0]
+
+    def test_geojson_sampling_schema_can_be_reused_for_tiling(self, temp_dir, monkeypatch):
+        data_dir = temp_dir / "sample_schema"
+        data_dir.mkdir()
+        for index, total_units in enumerate((10, 2.5)):
+            (data_dir / f"part-{index}.geojson").write_text(json.dumps({
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "properties": {"TOTAL_UNITS": total_units},
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [float(index), float(index)],
+                    },
+                }],
+            }))
+
+        spatial_sample = read_spatial_sample(
+            str(data_dir),
+            sample_ratio=1.0,
+            sample_cap=None,
+            seed=42,
+            geojson_workers=1,
+        )
+        source = GeoJSONSource(str(data_dir), batch_rows=1)
+        source.set_schema(spatial_sample.schema)
+        monkeypatch.setattr(
+            source,
+            "_iter_feature_batches_for_split",
+            lambda split: (_ for _ in ()).throw(AssertionError("schema rescanned input")),
+        )
+
+        assert source.schema().field("TOTAL_UNITS").type == pa.float64()
 
     def test_read_spatial_sample_splits_geojson_sample_cap(self, temp_dir):
         """Test GeoJSON partition sampling respects the total requested cap."""
@@ -672,6 +824,40 @@ class TestCSVSource:
         assert tables[0]["id"].to_pylist() == [1, 2]
         assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
 
+    def test_headerless_xy_indexes_are_converted_to_geometry(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,0,1\n2,2,3\n")
+
+        source = CSVSource(str(csv_path), x_col=1, y_col=2)
+        tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        assert tables[0].column_names == ["column_0", "column_1", "column_2", "geometry"]
+        assert tables[0]["column_0"].to_pylist() == [1, 2]
+        assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_headerless_txt_uses_whitespace_delimiter(self, temp_dir):
+        csv_path = temp_dir / "points.txt"
+        csv_path.write_text("1 0 1\n2 2 3\n")
+
+        source = CSVSource(str(csv_path), x_col=1, y_col=2)
+        tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        assert tables[0].column_names == ["column_0", "column_1", "column_2", "geometry"]
+        assert tables[0]["column_0"].to_pylist() == [1, 2]
+        assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_headerless_wkt_index_can_be_geometry_only(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,POINT (0 1)\n2,POINT (2 3)\n")
+
+        source = CSVSource(str(csv_path), wkt_col=1, geometry_only=True)
+        table = next(source.iter_tables())
+
+        assert table.column_names == ["geometry"]
+        assert wkb.loads(table["geometry"][0].as_py()).equals(Point(0, 1))
+
     def test_byte_splits_read_complete_rows_once(self, temp_dir):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text(
@@ -689,6 +875,47 @@ class TestCSVSource:
             for split in splits
             for table in source.iter_tables(split)
             for row_id in table["id"].to_pylist()
+        ]
+
+        assert ids == [1, 2, 3, 4]
+
+    def test_bzip2_splits_read_complete_rows_once(self, temp_dir):
+        csv_path = temp_dir / "points.csv.bz2"
+        header = "id,x,y,name\n".encode("utf-8")
+        rows = [
+            f"{i},{i},{i + 1},{os.urandom(96).hex()}\n".encode("utf-8")
+            for i in range(14_000)
+        ]
+        _write_bz2(csv_path, header + b"".join(rows), compresslevel=1)
+
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+        splits = source.create_splits(num_splits=4)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["id"].to_pylist()
+        ]
+
+        assert len(splits) == 4
+        assert ids == list(range(14_000))
+
+    def test_headerless_byte_splits_read_complete_rows_once(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text(
+            "1,0,1,alpha\n"
+            "2,2,3,beta\n"
+            "3,4,5,gamma\n"
+            "4,6,7,delta\n"
+        )
+
+        source = CSVSource(str(csv_path), x_col=1, y_col=2)
+        splits = source.create_splits(num_splits=5)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["column_0"].to_pylist()
         ]
 
         assert ids == [1, 2, 3, 4]
@@ -727,6 +954,25 @@ class TestCSVSource:
         assert isinstance(source, CSVSource)
         assert next(source.iter_tables()).column_names[-1] == "geom"
 
+    def test_source_for_path_detects_headerless_csv_with_indexes(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,0,1\n")
+
+        source = source_for_path(str(csv_path), geom_col="geom", csv_x_index=1, csv_y_index=2)
+
+        assert isinstance(source, CSVSource)
+        table = next(source.iter_tables())
+        assert table.column_names == ["column_0", "column_1", "column_2", "geom"]
+
+    def test_source_for_path_detects_bzip2_csv(self, temp_dir):
+        csv_path = temp_dir / "points.csv.bz2"
+        _write_bz2(csv_path, b"id,x,y\n1,0,1\n")
+
+        source = source_for_path(str(csv_path), geom_col="geom", csv_x_col="x", csv_y_col="y")
+
+        assert isinstance(source, CSVSource)
+        assert next(source.iter_tables()).column_names[-1] == "geom"
+
     def test_read_spatial_sample_uses_csv_geometry_columns(self, temp_dir):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
@@ -741,6 +987,66 @@ class TestCSVSource:
         assert sample.total_seen == 2
         assert sample.total_sampled == 2
         assert sample.sample_points.shape == (2, 2)
+
+    def test_read_spatial_sample_uses_headerless_csv_indexes(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,0,1\n2,2,3\n")
+
+        sample = read_spatial_sample(
+            str(csv_path),
+            csv_x_index=1,
+            csv_y_index=2,
+            source_workers=1,
+        )
+
+        assert sample.total_seen == 2
+        assert sample.total_sampled == 2
+        assert sample.sample_points.shape == (2, 2)
+        assert sample.schema is not None
+        assert sample.schema.names == ["column_0", "column_1", "column_2", "geometry"]
+
+    def test_csv_sampling_unifies_schema_across_splits(self, temp_dir):
+        csv_path = temp_dir / "mixed_types.csv"
+        csv_path.write_text(
+            "id,x,y,units,active,mixed,optional,code,zip_code\n"
+            "1,0,1,10,true,1,,001,00123\n"
+            "2,2,3,2.5,false,label,7,ABC,00456\n"
+        )
+
+        sample = read_spatial_sample(
+            str(csv_path),
+            csv_x_col="x",
+            csv_y_col="y",
+            csv_split_size=30,
+            sample_ratio=1.0,
+            source_workers=1,
+        )
+
+        assert sample.schema is not None
+        assert sample.schema.field("units").type == pa.float64()
+        assert sample.schema.field("active").type == pa.bool_()
+        assert sample.schema.field("mixed").type == pa.large_string()
+        assert sample.schema.field("optional").type == pa.int64()
+        assert sample.schema.field("code").type == pa.string()
+        assert sample.schema.field("zip_code").type == pa.string()
+
+        source = CSVSource(
+            str(csv_path),
+            x_col="x",
+            y_col="y",
+            split_size=30,
+        )
+        source.set_schema(sample.schema)
+        tables = list(source.iter_tables())
+
+        assert all(table.schema.equals(sample.schema) for table in tables)
+        combined = pa.concat_tables(tables)
+        assert combined["units"].to_pylist() == [10.0, 2.5]
+        assert combined["active"].to_pylist() == [True, False]
+        assert combined["mixed"].to_pylist() == ["1", "label"]
+        assert combined["optional"].to_pylist() == [None, 7]
+        assert combined["code"].to_pylist() == ["001", "ABC"]
+        assert combined["zip_code"].to_pylist() == ["00123", "00456"]
 
     def test_csv_source_preserves_native_crs(self, temp_dir):
         lon, lat = -118.25, 34.05
@@ -853,6 +1159,55 @@ class TestShapefileSource:
         assert "linearized_records=1" in caplog.text
         assert "skip_features=0" in caplog.text
 
+    def test_reads_all_shapefiles_from_zip_directly(self, temp_dir):
+        source_dir = temp_dir / "shapes"
+        source_dir.mkdir()
+        first = gpd.GeoDataFrame(
+            {"dataset": ["a", "a"], "id": [1, 2]},
+            geometry=[Point(0, 1), Point(2, 3)],
+            crs="EPSG:4326",
+        )
+        second = gpd.GeoDataFrame(
+            {"dataset": ["b", "b", "b"], "id": [10, 11, 12]},
+            geometry=[Point(4, 5), Point(6, 7), Point(8, 9)],
+            crs="EPSG:4326",
+        )
+        first.to_file(source_dir / "alpha.shp", engine="pyogrio")
+        second.to_file(source_dir / "beta.shp", engine="pyogrio")
+
+        zip_path = temp_dir / "bundle.zip"
+        _write_zip_from_dir(zip_path, source_dir)
+
+        source = ShapefileSource(str(zip_path))
+        tables = list(source.iter_tables())
+        ids = sorted(
+            row_id
+            for table in tables
+            for row_id in table["id"].to_pylist()
+        )
+        datasets = sorted(
+            value
+            for table in tables
+            for value in table["dataset"].to_pylist()
+        )
+
+        assert len(source._layers) == 2
+        assert ids == [1, 2, 10, 11, 12]
+        assert datasets == ["a", "a", "b", "b", "b"]
+        assert source.input_size_bytes() == zip_path.stat().st_size
+
+    def test_source_for_path_detects_zipped_shapefile(self, temp_dir):
+        source_dir = temp_dir / "zip-shp"
+        source_dir.mkdir()
+        gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[Point(0, 1)], crs="EPSG:4326")
+        gdf.to_file(source_dir / "points.shp", engine="pyogrio")
+        zip_path = temp_dir / "points.zip"
+        _write_zip_from_dir(zip_path, source_dir)
+
+        source = source_for_path(str(zip_path))
+
+        assert isinstance(source, ShapefileSource)
+
 
 class TestGDBSource:
     def test_detects_gdb_directory_inside_zip(self, temp_dir):
@@ -887,6 +1242,54 @@ class TestGDBSource:
 
         assert isinstance(source, GDBSource)
         assert source._layers[0].path.endswith("CAMS-Export.gdb")
+
+    def test_source_for_path_detects_renamed_zipped_gdb(self, temp_dir, monkeypatch):
+        import pyogrio
+
+        zip_path = temp_dir / "Export.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CAMS-Export.gdb/gdb", "gdb\n")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtable", "")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtablx", "")
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "Point",
+            },
+        )
+
+        source = source_for_path(str(zip_path))
+
+        assert isinstance(source, GDBSource)
+        assert source._layers[0].path.endswith("CAMS-Export.gdb")
+
+    def test_source_for_path_detects_gdb_directory_by_marker_file(self, temp_dir, monkeypatch):
+        import pyogrio
+
+        gdb_path = temp_dir / "CAMS-Export.gdb"
+        gdb_path.mkdir()
+        (gdb_path / "gdb").write_text("gdb\n")
+        (gdb_path / "a00000001.gdbtable").write_text("")
+        (gdb_path / "a00000001.gdbtablx").write_text("")
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "Point",
+            },
+        )
+
+        source = source_for_path(str(gdb_path))
+
+        assert isinstance(source, GDBSource)
+        assert source._layers[0].path == str(gdb_path)
 
 
 class TestDataSourceIntegration:

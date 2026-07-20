@@ -9,8 +9,9 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
-from starlet._internal.config import config_value, ensure_config_loaded
+from starlet._internal.config import config_value, ensure_config_loaded, get_loaded_config
 from starlet._internal.pmtiles.paths import discover_pmtiles_path
+from starlet._internal.internal_columns import QUERY_INTERNAL_COLS
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -23,13 +24,13 @@ GLOBAL_BBOX: BBox = (-LIM, -LIM, LIM, LIM)
 
 _TILER_CACHE: dict[tuple[str, int, int, int, int], Any] = {}
 _TILER_CACHE_LOCK = threading.Lock()
-_INTERNAL_QUERY_COLUMNS = frozenset((
-    "_tile_id",
-    "_bbox_xmin",
-    "_bbox_ymin",
-    "_bbox_xmax",
-    "_bbox_ymax",
-))
+_INTERNAL_QUERY_COLUMNS = frozenset(QUERY_INTERNAL_COLS)
+
+
+def get_config() -> dict[str, Any]:
+    """Return the current process-wide Starlet configuration."""
+    ensure_config_loaded()
+    return get_loaded_config()
 
 
 def _configured_tiler_cache_size() -> int:
@@ -93,6 +94,7 @@ def get_tile(
     x: int,
     y: int,
     output: dict[str, Any] | None = None,
+    attributes: Sequence[str] | None = None,
 ) -> bytes:
     """Return a pre-generated MVT tile or generate it on the fly.
 
@@ -102,8 +104,12 @@ def get_tile(
     If ``output`` is provided, it is updated with details such as where the tile
     came from and how long serving took. On-the-fly generation also reports the
     number of encoded features.
+
+    Pass ``attributes`` to limit non-geometry attributes when the tile is
+    generated from GeoParquet. Geometry is always included. Pre-generated
+    MVT/PMTiles are returned as-is.
     """
-    return _get_cached_vector_tiler(dataset_dir).get_tile(z, x, y, output=output)
+    return _get_cached_vector_tiler(dataset_dir).get_tile(z, x, y, output=output, attributes=attributes)
 
 
 def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:
@@ -280,7 +286,10 @@ def get_sample_record(
         batch_size=1,
     ):
         if not batch.empty:
-            record = batch.iloc[0].to_dict()
+            record = {
+                key: _record_property_value(value)
+                for key, value in batch.iloc[0].to_dict().items()
+            }
             for column in _INTERNAL_QUERY_COLUMNS:
                 record.pop(column, None)
             return record
@@ -531,6 +540,23 @@ def _drop_internal_query_columns(batch: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame
     if not columns:
         return batch
     return batch.drop(columns=columns)
+
+
+def _record_property_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _record_property_value(item) for key, item in value.items()}
+    if _is_map_entries(value):
+        return {key: _record_property_value(item_value) for key, item_value in value}
+    if isinstance(value, list):
+        return [_record_property_value(item) for item in value]
+    return value
+
+
+def _is_map_entries(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    )
 
 
 def _normalize_stats(stats: dict[str, Any]) -> dict[str, Any]:

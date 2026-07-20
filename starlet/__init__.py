@@ -29,6 +29,7 @@ __all__ = [
     "query_dataset_count",
     "query_dataset_size",
     "get_sample_record",
+    "get_config",
     "add_dataset",
     "delete_dataset",
     "add_dataset_async",
@@ -61,18 +62,22 @@ def tile(
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
+    csv_x_index: int | None = None,
+    csv_y_index: int | None = None,
+    csv_wkt_index: int | None = None,
     csv_split_size: int | str | None = None,
     src_crs: str | None = None,
     temp_dir: str | None = None,
     grid_size: int | None = None,
     histogram_dtype: str | None = None,
 ) -> TileResult:
-    """Partition a GeoParquet/GeoJSON dataset into spatially-tiled Parquet files.
+    """Partition a supported geospatial source into spatially-tiled Parquet files.
 
     Parameters
     ----------
     input : str
-        Path to a GeoParquet, GeoJSON, or GeoJSON-Lines file.
+        Path to a supported source file or directory. GeoLife PLT and GPX
+        inputs may be one file or a directory containing matching files.
     outdir : str
         Output directory. Tiled files go into ``<outdir>/parquet_tiles/``
         and histograms into ``<outdir>/histograms/``.
@@ -108,6 +113,11 @@ def tile(
         or provide ``csv_wkt_col`` instead.
     csv_wkt_col : str | None
         Column name containing WKT geometry for CSV inputs.
+    csv_x_index, csv_y_index : int | None
+        Zero-based x/y column positions for headerless CSV inputs. Provide
+        both, or provide ``csv_wkt_index`` instead.
+    csv_wkt_index : int | None
+        Zero-based WKT column position for a headerless CSV input.
     csv_split_size : int
         Target byte length for each CSV source split.
     src_crs : str
@@ -168,6 +178,9 @@ def tile(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=csv_split_size,
         src_crs=src_crs,
     )
@@ -201,12 +214,17 @@ def tile(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=csv_split_size,
         src_crs=src_crs,
         geojson_workers=parallelism,
         geoparquet_workers=parallelism,
         source_workers=parallelism,
     )
+    if spatial_sample.schema is not None:
+        source.set_schema(spatial_sample.schema)
     assigner = RSGroveAssigner.from_sample_and_mbr(
         sample_points=spatial_sample.sample_points,
         mbr=spatial_sample.mbr,
@@ -376,7 +394,7 @@ def build(
     Parameters
     ----------
     input : str
-        Path to source GeoParquet or GeoJSON file.
+        Path to a supported source file or directory.
     outdir : str
         Output dataset directory.
     zoom : int
@@ -603,6 +621,7 @@ from starlet.api import (  # noqa: E402
     estimate_range_count,
     get_dataset_metadata,
     get_dataset_summary,
+    get_config,
     get_tile,
     get_sample_record,
     list_datasets,

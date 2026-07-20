@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import bz2
 from concurrent.futures import as_completed
-from dataclasses import dataclass
-import io
+from dataclasses import dataclass, replace
 import json
 import logging
 from numbers import Number
+import os
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
-import ijson
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -21,6 +22,8 @@ from starlet._internal.tiling.datasource import (
     _attach_geoparquet_metadata,
     _combine_spatial_samples,
     _normalize_decimal_columns,
+    _properties_dataframe_to_arrow_table,
+    _unify_tabular_schemas,
     _reservoir_add,
     _spatial_sample_from_state,
     _split_sample_cap,
@@ -29,10 +32,17 @@ from starlet._internal.tiling.datasource import (
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
 
 logger = logging.getLogger(__name__)
+_BZ2_BLOCK_MAGIC = bytes.fromhex("314159265359")
+_BZ2_STREAM_HEADER_LEN = 4
 
 
 def is_geojson_path(path: str) -> bool:
     return path.lower().endswith(_GEOJSON_SUFFIXES)
+
+
+def _is_geojsonl_path(path: str) -> bool:
+    lower = path.lower()
+    return lower.endswith((".geojsonl", ".jsonl", ".geojsonl.bz2", ".jsonl.bz2"))
 
 
 @dataclass(frozen=True)
@@ -89,40 +99,54 @@ class GeoJSONSource(DataSource):
     # ---------------- schema ---------------- #
     def schema(self) -> pa.Schema:
         if self._schema is None:
-            first = self._read_first_batch()
-            if first is None or first.num_rows == 0:
-                # Empty input file. Create a minimal schema with geometry column.
-                base = pa.schema([("geometry", pa.binary())])
-                self._schema = _attach_geoparquet_metadata(
-                    base, self._crs_hint or self.src_crs
-                )
-            else:
-                # Lock schema with GeoParquet metadata
-                self._schema = _attach_geoparquet_metadata(
-                    first.schema, self._crs_hint or self.src_crs
+            property_schemas = []
+            for features in self._iter_feature_batches_for_split(None):
+                rows = [feature.get("properties") or {} for feature in features]
+                props_df = _normalize_decimal_columns(pd.DataFrame.from_records(rows))
+                property_schemas.append(
+                    _properties_dataframe_to_arrow_table(props_df).schema
                 )
 
+            properties_schema = _unify_tabular_schemas(property_schemas)
+            base = properties_schema.append(pa.field("geometry", pa.binary()))
+            self._schema = _attach_geoparquet_metadata(
+                base, self._crs_hint or self.src_crs
+            )
+
         return self._schema
+
+    def set_schema(self, schema: pa.Schema) -> None:
+        """Use a schema discovered by an earlier scan of this source."""
+        if "geometry" not in schema.names:
+            raise ValueError("GeoJSON schema must contain a geometry column")
+        self._schema = schema
 
     def input_size_bytes(self) -> int:
         return sum(file_path.stat().st_size for file_path in self._files)
 
     # ---------------- iterator ---------------- #
-    def create_splits(self) -> List[GeoJSONSplit]:
-        target_partition_size = 32 * 1024 * 1024
+    def create_splits(self, num_splits: Optional[int] = None) -> List[GeoJSONSplit]:
         splits: List[GeoJSONSplit] = []
         for file_path in self._files:
             file_size = file_path.stat().st_size
-            num_splits = max(1, (file_size + target_partition_size - 1) // target_partition_size)
+            if num_splits is None:
+                target_partition_size = 32 * 1024 * 1024
+                split_count = max(1, (file_size + target_partition_size - 1) // target_partition_size)
+            else:
+                split_count = max(1, int(num_splits))
             splits.extend(
                 GeoJSONSplit(path=str(file_path), offset=offset, length=length)
-                for offset, length in _geojson_partition_ranges(file_size, int(num_splits))
+                for offset, length in _geojson_partition_ranges(file_size, split_count)
             )
         return splits
 
     def iter_tables(self, split: Optional[GeoJSONSplit] = None) -> Iterable[pa.Table]:
         batch_index = 0
         crs_value = self._crs_hint or self.src_crs
+        schema = self.schema()
+        properties_schema = pa.schema(
+            [field for field in schema if field.name != "geometry"]
+        )
 
         import geopandas as gpd
 
@@ -135,7 +159,10 @@ class GeoJSONSource(DataSource):
 
             props_df = gdf.drop(columns="geometry")
             props_df = _normalize_decimal_columns(props_df)
-            props_table = pa.Table.from_pandas(props_df, preserve_index=False)
+            props_table = _properties_dataframe_to_arrow_table(
+                props_df,
+                schema=properties_schema,
+            )
 
             table = (
                 pa.table([geometry_col], names=["geometry"])
@@ -143,15 +170,7 @@ class GeoJSONSource(DataSource):
                 else props_table.append_column("geometry", geometry_col)
             )
 
-            # Attach GeoParquet metadata with CRS
-            schema_with_geo = _attach_geoparquet_metadata(table.schema, crs_value)
-            table = table.replace_schema_metadata(schema_with_geo.metadata)
-
-            if split is None and not self._schema:
-                self._schema = schema_with_geo
-
-            if self._schema is not None:
-                table = self._coerce_to_schema(table, self._schema)
+            table = table.cast(schema)
             table = table.combine_chunks()
 
             logger.debug(
@@ -172,89 +191,15 @@ class GeoJSONSource(DataSource):
                 yield from self._iter_feature_batches_for_split(source_split)
             return
 
-        reader = GeoJSONPartitionReader(split.path, split.offset, split.length, batch_size=self.batch_rows)
-        for feature_batch in reader.batches():
+        for feature_batch in _iter_feature_json_batches(
+            split.path,
+            split.offset,
+            split.length,
+            batch_size=self.batch_rows,
+        ):
             yield [json.loads(feature) for feature in feature_batch]
 
     # ---------------- internal helpers ---------------- #
-    def _read_first_batch(self) -> Optional[pa.Table]:
-        """Read the first batch of features to establish the schema."""
-        first_path = self._files[0]
-        file_size = first_path.stat().st_size
-        batches = GeoJSONPartitionReader(first_path, 0, file_size, batch_size=max(1, self.batch_rows)).batches()
-        try:
-            first_batch = next(batches)
-            features = [json.loads(feature_str) for feature_str in first_batch]
-        except StopIteration:
-            logger.info("GeoJSON read returned 0 rows when inferring schema")
-            return None
-        finally:
-            batches.close()
-
-        rows_props: List[Dict[str, Any]] = []
-        geometries: List[Any] = []
-
-        for feat in features:
-            rows_props.append(feat.get("properties") or {})
-            geometries.append(feat.get("geometry", None))
-
-        props_df = pd.DataFrame.from_records(rows_props)
-        props_df = _normalize_decimal_columns(props_df)
-        props_table = pa.Table.from_pandas(props_df, preserve_index=False)
-
-        wkb_list = _geometries_to_wkb(geometries)
-        geometry_col = pa.array(wkb_list, type=pa.binary())
-
-        if props_table.num_columns == 0:
-            return pa.table([geometry_col], names=["geometry"])
-
-        return props_table.append_column("geometry", geometry_col)
-
-    def _coerce_to_schema(self, t: pa.Table, schema: pa.Schema) -> pa.Table:
-        if t.schema.equals(schema):
-            return t
-
-        out_cols = []
-        out_fields = []
-        promoted = False
-        for fld in schema:
-            name = fld.name
-            if name in t.column_names:
-                col = t[name]
-                if not col.type.equals(fld.type):
-                    if pa.types.is_null(fld.type) and not pa.types.is_null(col.type):
-                        fld = pa.field(
-                            fld.name,
-                            col.type,
-                            nullable=True,
-                            metadata=fld.metadata,
-                        )
-                        promoted = True
-                    else:
-                        try:
-                            col = col.cast(fld.type)
-                        except Exception:
-                            logger.warning(
-                                "Type mismatch for column '%s': %s -> %s (kept original)",
-                                name, col.type, fld.type
-                            )
-                            fld = pa.field(
-                                fld.name,
-                                col.type,
-                                nullable=fld.nullable,
-                                metadata=fld.metadata,
-                            )
-                out_cols.append(col)
-                out_fields.append(fld)
-            else:
-                out_cols.append(pa.nulls(t.num_rows, type=fld.type))
-                out_fields.append(fld)
-
-        out_schema = pa.schema(out_fields, metadata=schema.metadata)
-        if promoted:
-            self._schema = out_schema
-        return pa.table(out_cols, schema=out_schema)
-
     @classmethod
     def read_spatial_sample(
         cls,
@@ -264,8 +209,9 @@ class GeoJSONSource(DataSource):
         sample_cap: Optional[int],
         seed: int,
         workers: Optional[int],
+        src_crs: str = "EPSG:4326",
     ) -> SpatialSample:
-        source = cls(path)
+        source = cls(path, src_crs=src_crs)
         splits = source.create_splits()
         sample_caps = _split_sample_cap(sample_cap, len(splits))
 
@@ -296,7 +242,15 @@ class GeoJSONSource(DataSource):
             parts: List[SpatialSample] = []
             for future in as_completed(futures):
                 parts.append(future.result())
-            return _combine_spatial_samples(parts)
+            sample = _combine_spatial_samples(parts)
+            properties_schema = _unify_tabular_schemas(
+                part.schema for part in parts if part.schema is not None
+            )
+            schema = _attach_geoparquet_metadata(
+                properties_schema.append(pa.field("geometry", pa.binary())),
+                source._crs_hint or source.src_crs,
+            )
+            return replace(sample, schema=schema)
 
 
 def _read_geojson_spatial_sample(
@@ -306,6 +260,7 @@ def _read_geojson_spatial_sample(
     sample_cap: Optional[int],
     seed: int,
     geojson_workers: Optional[int],
+    src_crs: str = "EPSG:4326",
 ) -> SpatialSample:
     return GeoJSONSource.read_spatial_sample(
         path,
@@ -313,23 +268,11 @@ def _read_geojson_spatial_sample(
         sample_cap=sample_cap,
         seed=seed,
         workers=geojson_workers,
+        src_crs=src_crs,
     )
 
 
-def iter_geojson_xy(feature_json):
-    try:
-        geometry = next(
-            ijson.items(
-                io.BytesIO(feature_json.encode("utf-8")),
-                "geometry",
-                use_float=True,
-            ),
-            None,
-        )
-    except Exception:
-        print("Failed to parse feature_json:")
-        raise
-
+def _iter_geojson_geometry_xy(geometry):
     stack = [geometry]
     while stack:
         v = stack.pop()
@@ -347,6 +290,11 @@ def iter_geojson_xy(feature_json):
                 stack.extend(reversed(v))
 
 
+def iter_geojson_xy(feature_json):
+    feature = json.loads(feature_json)
+    yield from _iter_geojson_geometry_xy(feature.get("geometry"))
+
+
 def _read_geojson_partition_spatial_sample(
     path: str,
     offset: int,
@@ -355,7 +303,6 @@ def _read_geojson_partition_spatial_sample(
     sample_cap: Optional[int],
     seed: int,
 ) -> SpatialSample:
-    reader = GeoJSONPartitionReader(path, offset, length, batch_size=1_024)
     rng = np.random.default_rng(seed)
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
@@ -363,11 +310,15 @@ def _read_geojson_partition_spatial_sample(
     y_sample: List[float] = []
     n_seen = 0
     n_batches = 0
+    property_schemas: List[pa.Schema] = []
 
-    for batch in reader:
+    for batch in _iter_feature_json_batches(path, offset, length, batch_size=1_024):
+        property_rows = []
         for feature_json in batch:
+            feature = json.loads(feature_json)
+            property_rows.append(feature.get("properties") or {})
             first_point = True
-            for x, y in iter_geojson_xy(feature_json):
+            for x, y in _iter_geojson_geometry_xy(feature.get("geometry")):
                 if x < min_x:
                     min_x = x
                 if x > max_x:
@@ -391,6 +342,10 @@ def _read_geojson_partition_spatial_sample(
                         y=y,
                     )
 
+        props_df = _normalize_decimal_columns(pd.DataFrame.from_records(property_rows))
+        property_schemas.append(
+            _properties_dataframe_to_arrow_table(props_df).schema
+        )
         n_batches += 1
 
     return _spatial_sample_from_state(
@@ -400,6 +355,62 @@ def _read_geojson_partition_spatial_sample(
         maxs=np.array([max_x, max_y], dtype=float),
         n_seen=n_seen,
         batches_read=n_batches,
+        schema=_unify_tabular_schemas(property_schemas),
+    )
+
+
+def _iter_feature_json_batches(
+    path: str,
+    offset: int,
+    length: int,
+    *,
+    batch_size: int,
+) -> Iterable[list[str]]:
+    if path.lower().endswith(".bz2"):
+        yield from _iter_bz2_feature_batches(path, offset, length, batch_size=batch_size)
+        return
+
+    reader = GeoJSONPartitionReader(path, offset, length, batch_size=batch_size)
+    yield from reader.batches()
+
+
+def _iter_bz2_feature_batches(
+    path: str,
+    offset: int,
+    length: int,
+    *,
+    batch_size: int,
+) -> Iterable[list[str]]:
+    block_starts, file_size = _bz2_block_starts(path)
+    split_end = min(offset + length, file_size)
+    first_owned = next((start for start in block_starts if start >= offset), None)
+    if first_owned is None or first_owned >= split_end:
+        return
+
+    stop_before = next((start for start in block_starts if start >= split_end), file_size)
+    payload, owned_output_len = _decompress_bz2_owned_blocks(
+        path,
+        block_starts=block_starts,
+        first_owned=first_owned,
+        stop_before=stop_before,
+    )
+    if not payload:
+        return
+
+    if _is_geojsonl_path(path):
+        yield from _iter_bz2_geojsonl_batches(
+            payload,
+            batch_size=batch_size,
+            trim_leading=offset > 0,
+            trim_trailing=stop_before < file_size,
+            owned_output_len=owned_output_len,
+        )
+        return
+
+    yield from _iter_feature_collection_batches_from_bytes(
+        payload,
+        batch_size=batch_size,
+        owned_output_len=owned_output_len,
     )
 
 
@@ -483,3 +494,127 @@ def _extract_feature_collection_crs_hint(buffer: str) -> Optional[str]:
             return name
 
     return None
+
+
+def _iter_bz2_geojsonl_batches(
+    payload: bytes,
+    *,
+    batch_size: int,
+    trim_leading: bool,
+    trim_trailing: bool,
+    owned_output_len: int,
+) -> Iterable[list[str]]:
+    if trim_leading:
+        first_newline = payload.find(b"\n")
+        if first_newline == -1:
+            return
+        payload = payload[first_newline + 1 :]
+        owned_output_len = max(0, owned_output_len - (first_newline + 1))
+
+    if trim_trailing:
+        if owned_output_len <= 0:
+            return
+        if payload[:owned_output_len].endswith(b"\n"):
+            payload = payload[:owned_output_len]
+        else:
+            trailing_newline = payload.find(b"\n", owned_output_len)
+            if trailing_newline == -1:
+                return
+            payload = payload[: trailing_newline + 1]
+
+    batch: list[str] = []
+    for line in payload.splitlines():
+        if not line.strip():
+            continue
+        batch.append(line.decode("utf-8"))
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _iter_feature_collection_batches_from_bytes(
+    payload: bytes,
+    *,
+    batch_size: int,
+    owned_output_len: int,
+) -> Iterable[list[str]]:
+    start = GeoJSONPartitionReader._next_feature_start(payload, 0, 0)
+    if start is None:
+        return
+
+    batch: list[str] = []
+    current_start = start
+    while current_start < len(payload):
+        if current_start >= owned_output_len:
+            break
+        next_start = GeoJSONPartitionReader._next_feature_start(
+            payload,
+            current_start + 1,
+            current_start + 1,
+        )
+        if next_start is None:
+            try:
+                current_end = GeoJSONPartitionReader._find_json_object_end(payload, current_start)
+            except ValueError:
+                break
+        else:
+            current_end = GeoJSONPartitionReader._trim_feature_end(payload, next_start)
+
+        batch.append(payload[current_start:current_end].decode("utf-8"))
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+
+        if next_start is None:
+            break
+        current_start = next_start
+
+    if batch:
+        yield batch
+
+
+def _bz2_block_starts(path: str) -> tuple[list[int], int]:
+    with open(path, "rb") as stream:
+        data = stream.read()
+    starts = [match.start() for match in re.finditer(re.escape(_BZ2_BLOCK_MAGIC), data)]
+    if not starts:
+        starts = [_BZ2_STREAM_HEADER_LEN]
+    return starts, len(data)
+
+
+def _decompress_bz2_owned_blocks(
+    path: str,
+    *,
+    block_starts: list[int],
+    first_owned: int,
+    stop_before: int,
+) -> tuple[bytes, int]:
+    with open(path, "rb") as stream:
+        header = stream.read(_BZ2_STREAM_HEADER_LEN)
+        decompressor = bz2.BZ2Decompressor()
+        decompressor.decompress(header)
+
+        owned_output = bytearray()
+        boundaries = [start for start in block_starts if start >= _BZ2_STREAM_HEADER_LEN]
+        if not boundaries or boundaries[0] != _BZ2_STREAM_HEADER_LEN:
+            boundaries.insert(0, _BZ2_STREAM_HEADER_LEN)
+        lookahead_stop = next((start for start in boundaries if start > stop_before), None)
+        boundaries.append(lookahead_stop if lookahead_stop is not None else os.path.getsize(path))
+        owned_output_len = 0
+
+        for segment_start, segment_end in zip(boundaries, boundaries[1:]):
+            if segment_start > stop_before:
+                break
+            if segment_end <= segment_start:
+                continue
+            stream.seek(segment_start)
+            chunk = stream.read(segment_end - segment_start)
+            decoded = decompressor.decompress(chunk)
+            if segment_start >= first_owned:
+                owned_output.extend(decoded)
+                if segment_start < stop_before:
+                    owned_output_len = len(owned_output)
+
+    return bytes(owned_output), owned_output_len

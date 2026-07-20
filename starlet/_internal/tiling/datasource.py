@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from concurrent.futures import as_completed
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional, List, Dict, Any, Tuple
 import logging
 import json
+import os
 from pathlib import Path
 from decimal import Decimal
+import math
 import zipfile
 
 import pandas as pd
@@ -14,16 +16,31 @@ import pyarrow as pa
 import numpy as np
 from shapely import from_wkb
 
+from starlet._internal.executor import create_process_executor
 from starlet._internal.tiling.RSGrove import EnvelopeNDLite
 from starlet._internal.tiling.utils_large import ensure_large_types
 
 logger = logging.getLogger(__name__)
 _GEOPARQUET_SUFFIXES = (".parquet", ".geoparquet")
-_GEOJSON_SUFFIXES = (".geojson", ".geojsonl", ".json", ".jsonl")
-_CSV_SUFFIXES = (".csv",".tsv",)
+_GEOJSON_SUFFIXES = (
+    ".geojson",
+    ".geojsonl",
+    ".json",
+    ".jsonl",
+    ".geojson.bz2",
+    ".geojsonl.bz2",
+    ".json.bz2",
+    ".jsonl.bz2",
+)
+_CSV_SUFFIXES = (".csv", ".tsv", ".txt", ".csv.bz2", ".tsv.bz2", ".txt.bz2")
+_PLT_SUFFIXES = (".plt",)
+_GPX_SUFFIXES = (".gpx",)
 _SHAPEFILE_SUFFIXES = (".shp",)
 _ZIP_SUFFIXES = (".zip",)
 _GDB_SUFFIXES = (".gdb",)
+_TAR_SUFFIXES = (".tar",)
+_TAR_BLOCK_SIZE = 512
+_TAR_SPLIT_SIZE = 32 * 1024 * 1024
 
 
 class DataSource:
@@ -36,89 +53,267 @@ class DataSource:
     def iter_tables(self, split: Optional[Any] = None) -> Iterable[pa.Table]:
         raise NotImplementedError
 
+    def iter_tables_for_schema_inference(
+        self,
+        split: Optional[Any] = None,
+    ) -> Iterable[pa.Table]:
+        return self.iter_tables(split)
+
+    def set_schema(self, schema: pa.Schema) -> None:
+        raise NotImplementedError
+
     def input_size_bytes(self) -> int:
         raise NotImplementedError
 
 
 @dataclass(frozen=True)
 class SpatialSample:
-    """Centroid sample and global bounds prepared for spatial partitioning."""
+    """Source metadata prepared during the initial spatial scan."""
 
     sample_points: np.ndarray
     mbr: EnvelopeNDLite
     total_seen: int
     total_sampled: int
     batches_read: int
+    schema: Optional[pa.Schema] = None
+
+
+@dataclass(frozen=True)
+class TarFileSplit:
+    path: str
+    offset: int
+    length: int
+
+
+@dataclass(frozen=True)
+class TarMember:
+    name: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class _TarHeader:
+    name: str
+    size: int
+    typeflag: str
+
+    @property
+    def data_size_padded(self) -> int:
+        return int(math.ceil(self.size / _TAR_BLOCK_SIZE) * _TAR_BLOCK_SIZE)
+
+    @property
+    def record_size(self) -> int:
+        return _TAR_BLOCK_SIZE + self.data_size_padded
 
 
 # ------------------------- Helpers ------------------------- #
 def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
     source_path = Path(path)
     if source_path.is_file():
-        return [source_path]
+        return [source_path] if str(source_path).lower().endswith(suffixes) else []
     if source_path.is_dir():
         return sorted(
             file_path
             for file_path in source_path.rglob("*")
-            if file_path.is_file() and file_path.suffix.lower() in suffixes
+            if file_path.is_file() and str(file_path).lower().endswith(suffixes)
         )
     raise FileNotFoundError(f"Source path does not exist: {path}")
 
 
-def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
-    """Return .gdb directory names contained in a zip archive."""
+def _iter_discoverable_files(path: str) -> Iterable[str]:
+    # Entry point for lightweight source detection: yield discoverable file
+    # names from a single file input or by walking a directory tree lazily.
+    source_path = Path(path)
+    if source_path.is_file():
+        yield from _iter_discoverable_file_path(source_path, relative_name=source_path.name)
+        return
+    if source_path.is_dir():
+        yield from _iter_discoverable_dir(source_path, root=source_path)
+        return
+    raise FileNotFoundError(f"Source path does not exist: {path}")
+
+
+def _iter_discoverable_dir(directory: Path, *, root: Path) -> Iterable[str]:
+    # Walk one directory level at a time and hand each real file off to the
+    # file-level helper while preserving root-relative names for detection.
+    with os.scandir(directory) as entries:
+        ordered_entries = sorted(entries, key=lambda entry: (entry.name.lower(), entry.name))
+    for entry in ordered_entries:
+        entry_path = Path(entry.path)
+        if entry.is_dir():
+            yield from _iter_discoverable_dir(entry_path, root=root)
+            continue
+        if entry.is_file():
+            relative_name = entry_path.relative_to(root).as_posix()
+            yield from _iter_discoverable_file_path(entry_path, relative_name=relative_name)
+
+
+def _iter_discoverable_file_path(path: Path, *, relative_name: str) -> Iterable[str]:
+    # Expand archive files into their member names; otherwise just yield the
+    # file name itself as a detection candidate.
+    lower_name = path.name.lower()
+    if lower_name.endswith(_TAR_SUFFIXES):
+        yield from _iter_tar_member_names(path)
+        return
+    if lower_name.endswith(_ZIP_SUFFIXES):
+        yield from _iter_zip_member_names(path)
+        return
+    yield relative_name
+
+
+def _iter_zip_member_names(path: str | Path) -> Iterable[str]:
     try:
         with zipfile.ZipFile(path) as archive:
-            names = archive.namelist()
+            for info in archive.infolist():
+                if not info.is_dir():
+                    yield info.filename
     except zipfile.BadZipFile:
-        return []
+        return
 
-    gdb_dirs = set()
-    for name in names:
-        parts = [part for part in Path(name).parts if part not in {"", "."}]
-        for index, part in enumerate(parts):
-            if part.lower().endswith(_GDB_SUFFIXES):
-                gdb_dirs.add("/".join(parts[: index + 1]))
+
+def _source_tar_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
+    source_path = Path(path)
+    if source_path.is_file():
+        if source_path.suffix.lower() in _TAR_SUFFIXES and _tar_first_member_matches_suffixes(source_path, suffixes):
+            return [source_path]
+        return []
+    if source_path.is_dir():
+        return sorted(
+            tar_path
+            for tar_path in source_path.rglob("*")
+            if tar_path.is_file()
+            and tar_path.suffix.lower() in _TAR_SUFFIXES
+            and _tar_first_member_matches_suffixes(tar_path, suffixes)
+        )
+    raise FileNotFoundError(f"Source path does not exist: {path}")
+
+
+def _tar_first_member_matches_suffixes(path: str | Path, suffixes: Tuple[str, ...]) -> bool:
+    member = _tar_first_member_name(path)
+    return bool(member and member.lower().endswith(suffixes))
+
+
+def _tar_first_member_name(path: str | Path) -> str | None:
+    for member_name in _iter_tar_member_names(path):
+        return member_name
+    return None
+
+
+def _iter_tar_member_names(path: str | Path) -> Iterable[str]:
+    with open(path, "rb") as stream:
+        file_size = Path(path).stat().st_size
+        offset = 0
+        while offset + _TAR_BLOCK_SIZE <= file_size:
+            stream.seek(offset)
+            block = stream.read(_TAR_BLOCK_SIZE)
+            if len(block) < _TAR_BLOCK_SIZE or not any(block):
                 break
-    return sorted(gdb_dirs)
+            header = _parse_tar_header(block)
+            if header is None:
+                break
+            if header.typeflag in {"", "0"}:
+                yield header.name
+            offset += header.record_size
+
+
+def _tar_splits(path: str) -> List[TarFileSplit]:
+    file_size = Path(path).stat().st_size
+    return [
+        TarFileSplit(path=path, offset=offset, length=min(_TAR_SPLIT_SIZE, file_size - offset))
+        for offset in range(0, file_size, _TAR_SPLIT_SIZE)
+    ]
+
+
+def _iter_tar_members_for_split(
+    path: str,
+    *,
+    offset: int,
+    length: int,
+    suffixes: Tuple[str, ...],
+) -> Iterable[TarMember]:
+    file_size = Path(path).stat().st_size
+    split_end = min(offset + length, file_size)
+    position = offset
+    with open(path, "rb") as stream:
+        while position + _TAR_BLOCK_SIZE <= file_size:
+            stream.seek(position)
+            block = stream.read(_TAR_BLOCK_SIZE)
+            if len(block) < _TAR_BLOCK_SIZE or not any(block):
+                break
+            header = _parse_tar_header(block)
+            if header is None:
+                position += _TAR_BLOCK_SIZE
+                continue
+            if position >= split_end:
+                break
+            data_offset = position + _TAR_BLOCK_SIZE
+            if header.typeflag in {"", "0"} and header.name.lower().endswith(suffixes):
+                stream.seek(data_offset)
+                yield TarMember(name=header.name, data=stream.read(header.size))
+            position += header.record_size
+
+
+def _parse_tar_header(block: bytes) -> _TarHeader | None:
+    if len(block) != _TAR_BLOCK_SIZE or not any(block):
+        return None
+    stored_checksum = _parse_tar_octal(block[148:156])
+    size = _parse_tar_octal(block[124:136])
+    if stored_checksum is None or size is None:
+        return None
+
+    checksum_block = bytearray(block)
+    checksum_block[148:156] = b" " * 8
+    if sum(checksum_block) != stored_checksum:
+        return None
+
+    name = block[0:100].split(b"\0", 1)[0].decode("utf-8", "replace")
+    prefix = block[345:500].split(b"\0", 1)[0].decode("utf-8", "replace")
+    if prefix:
+        name = f"{prefix}/{name}" if name else prefix
+    if not name:
+        return None
+    typeflag = block[156:157].decode("ascii", "ignore")
+    return _TarHeader(name=name, size=size, typeflag=typeflag)
+
+
+def _parse_tar_octal(raw: bytes) -> int | None:
+    text = raw.rstrip(b"\0 ").lstrip(b" ")
+    if not text:
+        return 0
+    try:
+        return int(text, 8)
+    except ValueError:
+        return None
 
 
 def _source_kind(path: str) -> str:
-    source_path = Path(path)
-    if source_path.is_file():
-        suffix = source_path.suffix.lower()
-        if suffix in _GEOJSON_SUFFIXES:
-            return "geojson"
-        if suffix in _GEOPARQUET_SUFFIXES:
-            return "geoparquet"
-        if suffix in _CSV_SUFFIXES:
-            return "csv"
-        if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
-            return "gdb"
-        if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:
-            return "shapefile"
-        raise ValueError(f"Unsupported source file type: {path}")
-
-    if source_path.is_dir() and source_path.suffix.lower() in _GDB_SUFFIXES:
-        return "gdb"
-
-    source_types = []
-    if _source_files(path, _GEOJSON_SUFFIXES):
-        source_types.append("geojson")
-    if _source_files(path, _GEOPARQUET_SUFFIXES):
-        source_types.append("geoparquet")
-    if _source_files(path, _CSV_SUFFIXES):
-        source_types.append("csv")
-    if _source_files(path, _SHAPEFILE_SUFFIXES) or _source_files(path, _ZIP_SUFFIXES):
-        source_types.append("shapefile")
-    if sorted(child for child in source_path.rglob("*.gdb") if child.is_dir()):
-        source_types.append("gdb")
-
-    if len(source_types) == 1:
-        return source_types[0]
-    if source_types:
-        raise ValueError(f"Source directory contains multiple supported source types: {path}")
+    for discovered_name in _iter_discoverable_files(path):
+        detected_type = _detect_source_type_from_name(discovered_name)
+        if detected_type is not None:
+            return detected_type
     raise ValueError(f"No supported geospatial files found in {path}")
+
+
+def _detect_source_type_from_name(name: str) -> str | None:
+    lower_name = name.lower()
+    if lower_name.endswith(_GEOJSON_SUFFIXES):
+        return "geojson"
+    if lower_name.endswith(_GEOPARQUET_SUFFIXES):
+        return "geoparquet"
+    if lower_name.endswith(_CSV_SUFFIXES):
+        return "csv"
+    if lower_name.endswith(_PLT_SUFFIXES):
+        return "plt"
+    if lower_name.endswith(_GPX_SUFFIXES):
+        return "gpx"
+    if lower_name.endswith(_SHAPEFILE_SUFFIXES):
+        return "shapefile"
+    path = Path(name)
+    if path.name.lower() == "gdb" or any(
+        part.lower().endswith(_GDB_SUFFIXES) for part in path.parts
+    ):
+        return "gdb"
+    return None
 
 
 def source_for_path(
@@ -128,6 +323,9 @@ def source_for_path(
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
+    csv_x_index: int | None = None,
+    csv_y_index: int | None = None,
+    csv_wkt_index: int | None = None,
     csv_split_size: int = 32 * 1024 * 1024,
     csv_batch_rows: int | None = None,
     src_crs: str = "EPSG:4326",
@@ -142,14 +340,18 @@ def source_for_path(
     if kind == "csv":
         return CSVSource(
             path,
-            x_col=csv_x_col,
-            y_col=csv_y_col,
-            wkt_col=csv_wkt_col,
+            x_col=csv_x_index if csv_x_index is not None else csv_x_col,
+            y_col=csv_y_index if csv_y_index is not None else csv_y_col,
+            wkt_col=csv_wkt_index if csv_wkt_index is not None else csv_wkt_col,
             split_size=csv_split_size,
             batch_rows=csv_batch_rows,
             src_crs=src_crs,
             geom_col=geom_col,
         )
+    if kind == "plt":
+        return PLTSource(path, geom_col=geom_col)
+    if kind == "gpx":
+        return GPXSource(path, geom_col=geom_col)
     if kind == "shapefile":
         return ShapefileSource(path, geom_col=geom_col)
     if kind == "gdb":
@@ -164,6 +366,9 @@ def read_spatial_sample(
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
+    csv_x_index: int | None = None,
+    csv_y_index: int | None = None,
+    csv_wkt_index: int | None = None,
     csv_split_size: int = 32 * 1024 * 1024,
     csv_batch_rows: int | None = None,
     src_crs: str = "EPSG:4326",
@@ -174,7 +379,7 @@ def read_spatial_sample(
     geoparquet_workers: Optional[int] = None,
     source_workers: Optional[int] = None,
 ) -> SpatialSample:
-    """Read a file once and return centroid sample points plus the global MBR."""
+    """Read a source once and return its spatial sample, MBR, and inferred schema."""
     kind = _source_kind(path)
     if kind == "geojson":
         return GeoJSONSource.read_spatial_sample(
@@ -183,6 +388,7 @@ def read_spatial_sample(
             sample_cap=sample_cap,
             seed=seed,
             workers=geojson_workers,
+            src_crs=src_crs,
         )
     if kind == "geoparquet":
         return GeoParquetSource.read_spatial_sample(
@@ -193,6 +399,15 @@ def read_spatial_sample(
             seed=seed,
             workers=geoparquet_workers,
         )
+    if kind == "gpx":
+        return GPXSource.read_spatial_sample(
+            path,
+            geom_col=geom_col,
+            sample_ratio=sample_ratio,
+            sample_cap=sample_cap,
+            seed=seed,
+            workers=source_workers,
+        )
 
     source = source_for_path(
         path,
@@ -200,26 +415,20 @@ def read_spatial_sample(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=csv_split_size,
         csv_batch_rows=csv_batch_rows,
         src_crs=src_crs,
     )
-    if isinstance(source, CSVSource):
-        source = CSVSource(
-            path,
-            x_col=csv_x_col,
-            y_col=csv_y_col,
-            wkt_col=csv_wkt_col,
-            split_size=csv_split_size,
-            batch_rows=csv_batch_rows,
-            src_crs=src_crs,
-            geometry_only=True,
-            geom_col=geom_col,
-        )
-    elif isinstance(source, ShapefileSource):
+    collect_schema = isinstance(source, CSVSource)
+    if isinstance(source, ShapefileSource):
         source = ShapefileSource(path, geometry_only=True, geom_col=geom_col)
     elif isinstance(source, GDBSource):
         source = GDBSource(path, geometry_only=True, geom_col=geom_col)
+    elif isinstance(source, PLTSource):
+        source = PLTSource(path, geometry_only=True, geom_col=geom_col)
     return _read_datasource_spatial_sample(
         source,
         geom_col=geom_col,
@@ -227,6 +436,7 @@ def read_spatial_sample(
         sample_cap=sample_cap,
         seed=seed,
         source_workers=source_workers,
+        collect_schema=collect_schema,
     )
 
 
@@ -312,6 +522,7 @@ def _spatial_sample_from_state(
     maxs: np.ndarray,
     n_seen: int,
     batches_read: int,
+    schema: Optional[pa.Schema] = None,
 ) -> SpatialSample:
     return SpatialSample(
         sample_points=(
@@ -326,6 +537,7 @@ def _spatial_sample_from_state(
         total_seen=n_seen,
         total_sampled=len(x_sample),
         batches_read=batches_read,
+        schema=schema,
     )
 
 
@@ -445,18 +657,23 @@ def _read_datasource_spatial_sample(
     sample_cap: Optional[int],
     seed: int,
     source_workers: Optional[int],
+    collect_schema: bool = False,
 ) -> SpatialSample:
     splits = source.create_splits()
     sample_caps = _split_sample_cap(sample_cap, len(splits))
 
     logger.info(
-        "Reading spatial sample from %s in %d source partitions with %s thread workers",
+        "Reading spatial sample from %s in %d source partitions with %s process workers",
         getattr(source, "path", "<source>"),
         len(splits),
         source_workers or "auto",
     )
 
-    with ThreadPoolExecutor(max_workers=source_workers) as executor:
+    with create_process_executor(
+        max_workers=source_workers,
+        logger=logger,
+        context="datasource spatial sampling",
+    ) as executor:
         futures = [
             executor.submit(
                 _read_datasource_split_spatial_sample,
@@ -466,13 +683,20 @@ def _read_datasource_spatial_sample(
                 sample_ratio,
                 sample_caps[index],
                 seed + index,
+                collect_schema,
             )
             for index, split in enumerate(splits)
         ]
         parts: List[SpatialSample] = []
         for future in as_completed(futures):
             parts.append(future.result())
-        return _combine_spatial_samples(parts)
+        sample = _combine_spatial_samples(parts)
+        if not collect_schema:
+            return sample
+        schema = _unify_tabular_schemas(
+            part.schema for part in parts if part.schema is not None
+        )
+        return replace(sample, schema=schema)
 
 
 def _read_datasource_split_spatial_sample(
@@ -482,6 +706,7 @@ def _read_datasource_split_spatial_sample(
     sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
+    collect_schema: bool = False,
 ) -> SpatialSample:
     rng = np.random.default_rng(seed)
     mins = np.array([+np.inf, +np.inf], dtype=np.float64)
@@ -490,12 +715,20 @@ def _read_datasource_split_spatial_sample(
     y_sample: List[float] = []
     n_seen = 0
     n_batches = 0
+    schemas: List[pa.Schema] = []
 
-    for table in source.iter_tables(split):
+    tables = (
+        source.iter_tables_for_schema_inference(split)
+        if collect_schema
+        else source.iter_tables(split)
+    )
+    for table in tables:
         table = table.combine_chunks()
         if table.num_rows == 0:
             continue
         n_batches += 1
+        if collect_schema:
+            schemas.append(table.schema)
         table = ensure_large_types(table, geom_col)
         geometries = _decode_wkb_geometries(
             table[geom_col].to_numpy(zero_copy_only=False),
@@ -536,19 +769,25 @@ def _read_datasource_split_spatial_sample(
         maxs=maxs,
         n_seen=n_seen,
         batches_read=n_batches,
+        schema=_unify_tabular_schemas(schemas) if schemas else None,
     )
 
 
-def _attach_geoparquet_metadata(schema: pa.Schema, crs_hint: Optional[str]) -> pa.Schema:
+def _attach_geoparquet_metadata(
+    schema: pa.Schema,
+    crs_hint: Optional[str],
+    *,
+    geom_col: str = "geometry",
+) -> pa.Schema:
     """
     Return a copy of `schema` with a minimal GeoParquet 'geo' JSON block so
     downstream writers (WriterPool) can inject tile bbox.
 
     Includes:
       - version: 1.1.0
-      - primary_column: geometry
-      - columns.geometry.encoding: WKB
-      - columns.geometry.crs: <crs_hint> (string hint if provided)
+      - primary_column: the selected geometry column
+      - columns.<geometry>.encoding: WKB
+      - columns.<geometry>.crs: <crs_hint> (string hint if provided)
     """
     md = dict(schema.metadata or {})
     if b"geo" in md:
@@ -560,9 +799,9 @@ def _attach_geoparquet_metadata(schema: pa.Schema, crs_hint: Optional[str]) -> p
         geo = {}
 
     geo.setdefault("version", "1.1.0")
-    geo.setdefault("primary_column", "geometry")
+    geo.setdefault("primary_column", geom_col)
     columns = geo.setdefault("columns", {})
-    geometry_meta = columns.setdefault("geometry", {})
+    geometry_meta = columns.setdefault(geom_col, {})
     geometry_meta.setdefault("encoding", "WKB")
     if crs_hint:
         try:
@@ -580,9 +819,9 @@ def _normalize_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
     GeoJSON batches.
 
     Decimal values become float64 so Arrow does not infer different
-    decimal128 precision/scale. Nested JSON-like values become compact JSON
-    strings so dynamic tag maps do not infer a different struct field set for
-    every batch.
+    decimal128 precision/scale. Nested JSON-like values are left intact; callers
+    that build Arrow tables should use ``_properties_dataframe_to_arrow_table``
+    so dynamic tag maps get a stable Arrow map type.
     """
     if df.empty:
         return df
@@ -614,18 +853,168 @@ def _normalize_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
         if isinstance(sample, Decimal):
             df[col] = s.map(lambda x: None if is_missing(x) else float(x))
-        elif isinstance(sample, (dict, list)):
-            df[col] = s.map(
-                lambda x: json.dumps(x, separators=(",", ":"), sort_keys=True, default=str)
-                if not is_missing(x)
-                else None
-            )
 
     return df
+
+
+def _properties_dataframe_to_arrow_table(
+    df: pd.DataFrame,
+    schema: pa.Schema | None = None,
+) -> pa.Table:
+    """Build an Arrow table for GeoJSON properties without stringifying maps."""
+    if df.empty and schema is None:
+        return pa.table({})
+
+    columns = []
+    fields = []
+
+    column_fields = schema or pa.schema(
+        pa.field(str(name), pa.null()) for name in df.columns
+    )
+    for field in column_fields:
+        name = field.name
+        values = (
+            df[name].tolist()
+            if name in df.columns
+            else [None] * len(df.index)
+        )
+        if schema is not None:
+            if pa.types.is_map(field.type):
+                array = pa.array(
+                    [_map_entries_or_none(value) for value in values],
+                    type=field.type,
+                )
+            elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+                array = pa.array(
+                    [_stringify_json_property_value(value) for value in values],
+                    type=field.type,
+                )
+            else:
+                array = pa.array(values, type=field.type)
+            columns.append(array)
+            fields.append(field)
+            continue
+
+        arrow_type = _geojson_property_arrow_type(values)
+        try:
+            if arrow_type is None:
+                array = pa.array(values)
+            else:
+                array = pa.array(
+                    [_map_entries_or_none(value) for value in values],
+                    type=arrow_type,
+                )
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+            array = pa.array(
+                [_stringify_json_property_value(value) for value in values],
+                type=pa.large_string(),
+            )
+        columns.append(array)
+        fields.append(pa.field(str(name), array.type))
+
+    return pa.table(columns, schema=pa.schema(fields))
+
+
+def _unify_tabular_schemas(schemas: Iterable[pa.Schema]) -> pa.Schema:
+    """Resolve independently inferred table schemas into one source schema."""
+    schemas = list(schemas)
+    fields_by_name: Dict[str, List[pa.Field]] = {}
+    field_order: List[str] = []
+    for schema in schemas:
+        for field in schema:
+            if field.name not in fields_by_name:
+                fields_by_name[field.name] = []
+                field_order.append(field.name)
+            fields_by_name[field.name].append(field)
+
+    fields = []
+    for name in field_order:
+        source_fields = fields_by_name[name]
+        source_types = [field.type for field in source_fields]
+        non_null_types = [field_type for field_type in source_types if not pa.types.is_null(field_type)]
+
+        if not non_null_types:
+            field_type = pa.null()
+        elif all(
+            pa.types.is_integer(field_type) or pa.types.is_floating(field_type)
+            for field_type in non_null_types
+        ):
+            field_type = pa.unify_schemas(
+                [pa.schema([pa.field(name, source_type)]) for source_type in non_null_types],
+                promote_options="permissive",
+            ).field(name).type
+        elif any(
+            pa.types.is_string(field_type) or pa.types.is_large_string(field_type)
+            for field_type in non_null_types
+        ) and len(set(non_null_types)) > 1:
+            field_type = pa.large_string()
+        else:
+            try:
+                field_type = pa.unify_schemas(
+                    [pa.schema([pa.field(name, source_type)]) for source_type in non_null_types],
+                    promote_options="permissive",
+                ).field(name).type
+            except pa.ArrowTypeError:
+                field_type = pa.large_string()
+
+        metadata = next((field.metadata for field in source_fields if field.metadata), None)
+        fields.append(pa.field(name, field_type, nullable=True, metadata=metadata))
+
+    schema_metadata = next(
+        (schema.metadata for schema in schemas if schema.metadata),
+        None,
+    )
+    return pa.schema(fields, metadata=schema_metadata)
+
+
+def _geojson_property_arrow_type(values: list[Any]) -> pa.DataType | None:
+    sample = next((value for value in values if not _is_missing_property_value(value)), None)
+    if not isinstance(sample, dict):
+        return None
+    if all(
+        _is_missing_property_value(value) or _is_string_map(value)
+        for value in values
+    ):
+        return pa.map_(pa.string(), pa.string())
+    return None
+
+
+def _is_missing_property_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (dict, list)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _is_string_map(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and (item is None or isinstance(item, str))
+        for key, item in value.items()
+    )
+
+
+def _map_entries_or_none(value: Any) -> list[tuple[str, str | None]] | None:
+    if _is_missing_property_value(value):
+        return None
+    return list(value.items())
+
+
+def _stringify_json_property_value(value: Any) -> str | None:
+    if _is_missing_property_value(value):
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+    return str(value)
 
 # Backward-compatible re-exports for callers importing concrete sources from
 # this module.
 from starlet._internal.tiling.geojson_source import GeoJSONSource, GeoJSONSplit
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
 from starlet._internal.tiling.csv_source import CSVSource, CSVSplit
+from starlet._internal.tiling.plt_source import PLTSource, PLTSplit
+from starlet._internal.tiling.gpx_source import GPXSource, GPXSplit
 from starlet._internal.tiling.vector_source import GDBSource, ShapefileSource, VectorLayerSplit
