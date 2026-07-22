@@ -270,6 +270,68 @@ class IntermediateVectorTile:
             self._seq += 1
             heapq.heappush(self._heap, entry)
 
+    def triage(self, n_bins: int = 10) -> None:
+        """Apply numeric quantization triage.
+
+        For each int/float property across all retained features, divides the
+        value range into n_bins equal-width bins and replaces every value with
+        its bin midpoint. This reduces the number of distinct values in the MVT
+        property dictionary — fewer dictionary entries → smaller encoded tile —
+        without dropping any features or changing their geometries.
+
+        Call this after all add_feature() calls and before encode().
+        """
+        if not self._heap:
+            return
+
+        # Step 1: collect all values for each numeric column across the heap
+        numeric_cols: dict[str, list[float]] = {}
+        for _, _, feature in self._heap:
+            for key, value in feature.properties.items():
+                # bool is a subclass of int in Python — exclude it explicitly
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    numeric_cols.setdefault(key, []).append(float(value))
+
+        if not numeric_cols:
+            return
+
+        # Step 2: compute equal-width bin boundaries and midpoints per column
+        bin_midpoints: dict[str, list[float]] = {}
+        bin_mins: dict[str, float] = {}
+        bin_steps: dict[str, float] = {}
+        for col, values in numeric_cols.items():
+            lo, hi = min(values), max(values)
+            if lo == hi:
+                # All values identical — one bin, midpoint is the value itself
+                bin_midpoints[col] = [lo]
+                bin_mins[col] = lo
+                bin_steps[col] = 1.0
+            else:
+                step = (hi - lo) / n_bins
+                bin_midpoints[col] = [lo + (i + 0.5) * step for i in range(n_bins)]
+                bin_mins[col] = lo
+                bin_steps[col] = step
+
+        # Step 3: rebuild the heap with quantized property values
+        # _TileFeature is frozen so we create a new instance per feature
+        new_heap: list[tuple[int, int, _TileFeature]] = []
+        for priority, seq, feature in self._heap:
+            new_props = dict(feature.properties)
+            for col, midpoints in bin_midpoints.items():
+                if col not in new_props:
+                    continue
+                value = float(new_props[col])
+                lo = bin_mins[col]
+                step = bin_steps[col]
+                # Which bin does this value fall into?
+                bin_idx = int((value - lo) / step)
+                # Clamp — the maximum value lands exactly on the upper edge
+                bin_idx = max(0, min(len(midpoints) - 1, bin_idx))
+                new_props[col] = midpoints[bin_idx]
+            new_heap.append((priority, seq, _TileFeature(feature.geometry, new_props)))
+
+        self._heap = new_heap
+
     def encode(self, layer_name: str = "layer0") -> bytes:
         """Encode the retained features as an MVT binary payload."""
         layer = {
