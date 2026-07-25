@@ -36,6 +36,10 @@ _BZ2_BLOCK_MAGIC = bytes.fromhex("314159265359")
 _BZ2_STREAM_HEADER_LEN = 4
 
 
+def _describe_geojson_split(path: str, offset: int, length: int) -> str:
+    return f"path={path!r}, offset={offset}, length={length}"
+
+
 def is_geojson_path(path: str) -> bool:
     return path.lower().endswith(_GEOJSON_SUFFIXES)
 
@@ -230,6 +234,7 @@ class GeoJSONSource(DataSource):
             futures = [
                 ex.submit(
                     _read_geojson_partition_spatial_sample,
+                    idx,
                     split.path,
                     split.offset,
                     split.length,
@@ -296,6 +301,7 @@ def iter_geojson_xy(feature_json):
 
 
 def _read_geojson_partition_spatial_sample(
+    split_index: int,
     path: str,
     offset: int,
     length: int,
@@ -311,42 +317,47 @@ def _read_geojson_partition_spatial_sample(
     n_seen = 0
     n_batches = 0
     property_schemas: List[pa.Schema] = []
+    try:
+        for batch in _iter_feature_json_batches(path, offset, length, batch_size=1_024):
+            property_rows = []
+            for feature_json in batch:
+                feature = json.loads(feature_json)
+                property_rows.append(feature.get("properties") or {})
+                first_point = True
+                for x, y in _iter_geojson_geometry_xy(feature.get("geometry")):
+                    if x < min_x:
+                        min_x = x
+                    if x > max_x:
+                        max_x = x
+                    if y < min_y:
+                        min_y = y
+                    if y > max_y:
+                        max_y = y
 
-    for batch in _iter_feature_json_batches(path, offset, length, batch_size=1_024):
-        property_rows = []
-        for feature_json in batch:
-            feature = json.loads(feature_json)
-            property_rows.append(feature.get("properties") or {})
-            first_point = True
-            for x, y in _iter_geojson_geometry_xy(feature.get("geometry")):
-                if x < min_x:
-                    min_x = x
-                if x > max_x:
-                    max_x = x
-                if y < min_y:
-                    min_y = y
-                if y > max_y:
-                    max_y = y
+                    if first_point:
+                        first_point = False
+                        n_seen += 1
+                        _reservoir_add(
+                            rng=rng,
+                            sample_cap=sample_cap,
+                            sample_ratio=sample_ratio,
+                            x_sample=x_sample,
+                            y_sample=y_sample,
+                            n_seen=n_seen,
+                            x=x,
+                            y=y,
+                        )
 
-                if first_point:
-                    first_point = False
-                    n_seen += 1
-                    _reservoir_add(
-                        rng=rng,
-                        sample_cap=sample_cap,
-                        sample_ratio=sample_ratio,
-                        x_sample=x_sample,
-                        y_sample=y_sample,
-                        n_seen=n_seen,
-                        x=x,
-                        y=y,
-                    )
-
-        props_df = _normalize_decimal_columns(pd.DataFrame.from_records(property_rows))
-        property_schemas.append(
-            _properties_dataframe_to_arrow_table(props_df).schema
-        )
-        n_batches += 1
+            props_df = _normalize_decimal_columns(pd.DataFrame.from_records(property_rows))
+            property_schemas.append(
+                _properties_dataframe_to_arrow_table(props_df).schema
+            )
+            n_batches += 1
+    except Exception as exc:
+        raise ValueError(
+            "GeoJSON spatial sampling failed for "
+            f"split_index={split_index} ({_describe_geojson_split(path, offset, length)})"
+        ) from exc
 
     return _spatial_sample_from_state(
         x_sample=x_sample,

@@ -37,7 +37,10 @@ from starlet._internal.tiling.datasource import (
     read_spatial_sample,
     source_for_path,
 )
-from starlet._internal.tiling.geojson_source import iter_geojson_xy
+from starlet._internal.tiling.geojson_source import (
+    _read_geojson_partition_spatial_sample,
+    iter_geojson_xy,
+)
 from starlet._internal.tiling.geoparquet_source import _read_geoparquet_split_spatial_sample
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
 from starlet._internal.tiling.vector_source import _zip_gdb_member_dirs
@@ -261,6 +264,28 @@ class TestGeoParquetSource:
             for split in splits
             for table in source.iter_tables(split)
         ) == 2
+
+
+class TestGeoJSONSpatialSampleErrors:
+    def test_partition_error_includes_split_context(self, monkeypatch):
+        def fail_iter(*args, **kwargs):
+            raise ValueError('Could not find the object containing a "type": "Feature" member')
+
+        monkeypatch.setattr(
+            "starlet._internal.tiling.geojson_source._iter_feature_json_batches",
+            fail_iter,
+        )
+
+        with pytest.raises(ValueError, match=r"split_index=7 .*broken\.geojson\.bz2.*offset=1024.*length=2048"):
+            _read_geojson_partition_spatial_sample(
+                7,
+                "/tmp/broken.geojson.bz2",
+                1024,
+                2048,
+                0.1,
+                100,
+                42,
+            )
 
     def test_schema_validation(self, sample_parquet_file):
         """Test that schema is accessible and valid."""
