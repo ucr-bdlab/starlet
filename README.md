@@ -5,7 +5,7 @@ partitions a GeoParquet / GeoJSON file into spatial tiles, generates
 [Mapbox Vector Tiles](https://github.com/mapbox/vector-tile-spec), and serves
 them over HTTP with a built-in web viewer — all from a single command-line tool.
 
-![Starlet vector-tile viewer showing country polygons with the MVT tile grid](https://raw.githubusercontent.com/ucr-bdlab/starlet/master/docs/images/starlet-viewer.png)
+![Starlet vector-tile viewer showing country polygons with the MVT tile grid](docs/images/starlet-viewer.png)
 
 ## Install
 
@@ -39,7 +39,7 @@ starlet serve --dir datasets --port 8765
 
 Open <http://localhost:8765> and pick your dataset to explore it on a map.
 
-![Starlet dataset browser](https://raw.githubusercontent.com/ucr-bdlab/starlet/master/docs/images/starlet-datasets.png)
+![Starlet dataset browser](docs/images/starlet-datasets.png)
 
 ## Commands
 
@@ -122,29 +122,25 @@ dataset even without pre-generating every zoom.
 
 Settings you reuse often (partition size, zoom, worker count, …) can live in a
 `starlet.toml` file instead of being passed on every command. Copy
-[`starlet.toml.example`](https://github.com/ucr-bdlab/starlet/blob/master/starlet.toml.example)
-to `starlet.toml` and edit it; Starlet loads it automatically. CLI flags always
-override the file. See
-[docs/CONFIGURATION.md](https://github.com/ucr-bdlab/starlet/blob/master/docs/CONFIGURATION.md)
-for the full list of keys.
+[`starlet.toml.example`](starlet.toml.example) to `starlet.toml` and edit it;
+Starlet loads it automatically. CLI flags always override the file. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full list of keys.
 
 ## Deploying a server
 
-[docs/DEPLOYMENT.md](https://github.com/ucr-bdlab/starlet/blob/master/docs/DEPLOYMENT.md)
-walks through standing up a production tile server, including a no-root recipe
-behind an existing Apache install.
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) walks through standing up a production
+tile server, including a no-root recipe behind an existing Apache install.
 
 ## Using Starlet from Python
 
 `starlet` is also importable — `tile()`, `generate_mvt()`, `build()`,
 `export_pmtiles()`, and `create_app()` are documented in
-[docs/PUBLIC_API.md](https://github.com/ucr-bdlab/starlet/blob/master/docs/PUBLIC_API.md).
+[docs/PUBLIC_API.md](docs/PUBLIC_API.md).
 
 ---
 
 **Want to work on Starlet itself** — run it from a clone, run the tests, or
-contribute a change? See
-**[DEVELOPMENT.md](https://github.com/ucr-bdlab/starlet/blob/master/DEVELOPMENT.md)**.
+contribute a change? See **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
 ## License
 
