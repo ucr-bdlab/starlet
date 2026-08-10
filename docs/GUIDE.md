@@ -250,23 +250,27 @@ fallback for anything unmatched):
   paint: {
     "fill-color": [
       "match", ["get", "GEN_DESCRI"],
-      "Wetlands",     "#4292c6",
-      "Woodland",     "#238b45",
-      "Grassland",    "#addd8e",
-      "Desert",       "#fee391",
-      "Agriculture",  "#fdae6b",
-      "Urban",        "#969696",
-      /* fallback */  "#dddddd"
+      "Woodland or Forest",   "#238b45",
+      "Chaparral",            "#9e8f2e",
+      "Grassland",            "#addd8e",
+      "Scrub",                "#c9a86a",
+      "Wetlands",             "#4292c6",
+      "Agriculture",          "#fdae6b",
+      "Develop or Disturbed", "#969696",
+      /* fallback */          "#dddddd"
     ],
-    "fill-opacity": 0.7,
+    "fill-opacity": 0.8,
     "fill-outline-color": "#00000022"
   }
 }
 ```
 
+![Categorical fill: Riverside County vegetation polygons colored by their GEN_DESCRI class, with a legend](images/style-categorical.png)
+
 Same idea for admin boundaries colored by a category — e.g. provinces by `type`
 (`["match", ["get", "type"], "State", "#…", "Province", "#…", "#ccc"]`), or counties
-by state FIPS `["get", "STATEFP"]`.
+by state FIPS `["get", "STATEFP"]`. The legend above is just plain HTML — MapLibre
+doesn't draw one for you.
 
 ## 2b. Gradient / choropleth — color by a numeric attribute
 
@@ -284,14 +288,16 @@ land area `ALAND` (square meters); stops go from small → large:
       "interpolate", ["linear"], ["get", "ALAND"],
       0,       "#fff7ec",
       1.0e9,   "#fdd49e",
-      5.0e9,   "#fc8d59",
-      2.0e10,  "#d7301f",
-      6.0e10,  "#7f0000"
+      3.0e9,   "#fc8d59",
+      1.0e10,  "#d7301f",
+      5.0e10,  "#7f0000"
     ],
-    "fill-opacity": 0.75
+    "fill-opacity": 0.8
   }
 }
 ```
+
+![Choropleth: US counties shaded from cream to dark red by land area, with a color-ramp legend](images/style-gradient.png)
 
 Tips:
 - For skewed data (population, area), interpolate on a log with
@@ -315,7 +321,7 @@ in that glyph source. Missing glyphs is the #1 reason labels don't appear.
   minzoom: 5,
   layout: {
     "text-field": ["get", "NAME"],              // e.g. "Franklin"
-    "text-font": ["Open Sans Regular"],         // must exist in the glyphs source
+    "text-font": ["Noto Sans Regular"],         // must exist in the glyphs source
     "text-size": ["interpolate", ["linear"], ["zoom"], 5, 10, 10, 14],
     "text-anchor": "center",
     "text-allow-overlap": false                 // let MapLibre de-clutter
@@ -328,10 +334,19 @@ in that glyph source. Missing glyphs is the #1 reason labels don't appear.
 }
 ```
 
+![County name labels rendered over the San Francisco Bay Area with white halos](images/style-label.png)
+
 - On polygons, MapLibre places one label near each feature's center automatically.
 - Combine strings with `format`: `["format", ["get", "NAME"], {}, "\n", {}, ["get", "STATEFP"], {"font-scale": 0.8}]`.
-- The `glyphs` URL above is MapLibre's public demo endpoint (has *Open Sans* / *Noto
-  Sans*). For production, host your own font PBFs and point `glyphs` at them.
+- The `glyphs` URL above is MapLibre's public demo endpoint (it serves *Noto Sans
+  Regular* and *Noto Sans Bold* — the `text-font` name must match one of those, or the
+  labels silently won't draw). For production, host your own font PBFs and point
+  `glyphs` at them.
+- **Heads-up on tiled labels:** a polygon that spans several tiles is clipped into
+  each one, so a large feature can get a *repeated* label (one per tile piece). It's
+  most visible on big features at high zoom — the Bay-Area counties above stay clean
+  because each fits in a tile. Mitigate by labeling at a zoom where features are
+  single-tile, or from a dedicated point/centroid layer.
 
 ## 2d. Putting it together
 
@@ -347,7 +362,7 @@ layers: [
                  paint: { "line-color": "#00000055", "line-width": 0.5 } },
   /* label  */ { id: "label",  type: "symbol", source: "starlet", "source-layer": "layer0",
                  minzoom: 5,
-                 layout: { "text-field": ["get", "NAME"], "text-font": ["Open Sans Regular"], "text-size": 12 },
+                 layout: { "text-field": ["get", "NAME"], "text-font": ["Noto Sans Regular"], "text-size": 12 },
                  paint: { "text-color": "#222", "text-halo-color": "#fff", "text-halo-width": 1.4 } }
 ]
 ```
