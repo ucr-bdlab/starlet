@@ -137,6 +137,10 @@ tile server, including a no-root recipe behind an existing Apache install.
 `export_pmtiles()`, and `create_app()` are documented in
 [docs/PUBLIC_API.md](docs/PUBLIC_API.md).
 
+For worked examples — using the CLI or API **inside another project**, embedding
+the tile server, and **styling the tiles with MapLibre** (categorical, gradient,
+and label recipes) — see the [**Guide**](docs/GUIDE.md).
+
 ---
 
 **Want to work on Starlet itself** — run it from a clone, run the tests, or
