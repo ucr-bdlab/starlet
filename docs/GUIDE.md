@@ -193,6 +193,19 @@ match the geometry: `fill`/`line` for polygons, `line` for lines, `circle` for p
 If a dataset mixes geometry types, split them with
 `"filter": ["==", ["geometry-type"], "Polygon"]`.
 
+### The example datasets
+
+The recipes below use two open datasets you can download and tile yourself with
+`starlet build --input <file> --outdir datasets/<name>`:
+
+- **[Western Riverside County vegetation](https://data.ca.gov/dataset/vegetation-western-riverside-county-2005-ds170)**
+  (California Dept. of Fish & Wildlife / MSHCP) — polygons with a `GEN_DESCRI`
+  land-cover class → the **categorical** example.
+- **[US counties — TIGER/Line 2018](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.2018.html)**
+  (US Census Bureau —
+  [direct download](https://www2.census.gov/geo/tiger/TIGER2018/COUNTY/tl_2018_us_county.zip))
+  — county polygons with `NAME` and `ALAND` → the **gradient** and **label** examples.
+
 ## The base map
 
 A minimal, self-contained MapLibre page pointing at a running `starlet serve`. Drop

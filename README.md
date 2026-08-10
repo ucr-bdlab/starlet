@@ -41,6 +41,10 @@ Open <http://localhost:8765> and pick your dataset to explore it on a map.
 
 ![Starlet dataset browser](docs/images/starlet-datasets.png)
 
+> 📖 **[Read the Guide →](docs/GUIDE.md)** — using Starlet inside another project
+> (CLI, Python API, embedded server) and **styling the tiles with MapLibre**
+> (categorical, gradient, and label recipes, with screenshots).
+
 ## Commands
 
 Everything runs through the `starlet` CLI. Run `starlet <command> --help` for the
